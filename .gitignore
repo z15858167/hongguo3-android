@@ -16,3 +16,7 @@ captures/
 .fleet/
 **/.DS_Store
 *.log
+
+# 本地编译产物
+.cxx/
+app/.cxx/
