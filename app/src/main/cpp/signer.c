@@ -41,8 +41,28 @@ static int in_list(const char *list, const char *x) {
     return 0;
 }
 
-/* 从 /proc/self/maps 里找 libmetasec_ml.so：最低映射地址 = 加载基址；同时记录可执行区间数 */
+/*
+ * 找加载基址。
+ *
+ * 主方法：dlopen(RTLD_NOLOAD) 拿已加载句柄 → dlsym("JNI_OnLoad") → dladdr 反查 dli_fbase。
+ * 这条路不依赖 maps 里的文件名：extractNativeLibs=false 时 so 是从 base.apk 里直接
+ * mmap 的，/proc/self/maps 里只有 "base.apk"，搜 "libmetasec_ml.so" 永远落空（真机实测踩坑）。
+ *
+ * 兜底：老办法扫 maps（so 被解压到磁盘的场景，比如 extractNativeLibs=true）。
+ */
 static uintptr_t find_base(void) {
+    void *h = dlopen(SO_NAME, RTLD_NOW | RTLD_NOLOAD);
+    if (!h) h = dlopen(SO_NAME, RTLD_NOW);
+    if (h) {
+        void *sym = dlsym(h, "JNI_OnLoad");
+        Dl_info di;
+        memset(&di, 0, sizeof di);
+        if (sym && dladdr(sym, &di) && (uintptr_t) di.dli_fbase != 0) {
+            snprintf(g_note, sizeof g_note, "基址来自 dladdr(%s)",
+                     di.dli_fname ? di.dli_fname : "?");
+            return (uintptr_t) di.dli_fbase;
+        }
+    }
     FILE *f = fopen("/proc/self/maps", "r");
     if (!f) {
         snprintf(g_note, sizeof g_note, "打不开 /proc/self/maps");
@@ -57,7 +77,7 @@ static uintptr_t find_base(void) {
         if (lo == 0 || (uintptr_t) a < lo) lo = (uintptr_t) a;
     }
     fclose(f);
-    if (lo == 0) snprintf(g_note, sizeof g_note, "maps 里没有 " SO_NAME);
+    if (lo == 0) snprintf(g_note, sizeof g_note, "dladdr 和 maps 都没定位到 " SO_NAME);
     return lo;
 }
 

@@ -3,7 +3,9 @@
 """本机 github.com 直连/代理都不通（只有 api.github.com 通），所以 git push 走不了，
 这里用 GitHub Git Data REST API 手动提交：blob -> tree -> commit -> ref。
 
-用法:  python3 tools/ghpush.py "提交说明"
+用法:
+  python3 tools/ghpush.py "提交说明"                # 提交 git ls-files 里的全部文件
+  python3 tools/ghpush.py "提交说明" --rm a b c    # 同时在远端删除指定路径
 """
 import base64
 import json
@@ -56,7 +58,13 @@ def req(method, path, payload=None, raw=False):
 
 
 def main():
-    msg = sys.argv[1] if len(sys.argv) > 1 else "update"
+    argv = sys.argv[1:]
+    rms = []
+    if "--rm" in argv:
+        i = argv.index("--rm")
+        rms = argv[i + 1:]
+        argv = argv[:i]
+    msg = argv[0] if argv else "update"
     files = subprocess.run(["git", "ls-files"], cwd=ROOT, capture_output=True,
                            text=True).stdout.split()
     if not files:
@@ -80,12 +88,16 @@ def main():
             "encoding": "base64"})
         tree.append({"path": p, "mode": mode, "type": "blob", "sha": blob["sha"]})
 
+    # sha=null 表示从树上移除该路径（GitHub Git Data API 的删除语义）
+    for p in rms:
+        tree.append({"path": p, "mode": "100644", "type": "blob", "sha": None})
+
     new_tree = req("POST", "/git/trees", {"base_tree": base_tree, "tree": tree})
     commit = req("POST", "/git/commits",
                  {"message": msg, "tree": new_tree["sha"], "parents": [head]})
     req("PATCH", "/git/refs/heads/" + BRANCH, {"sha": commit["sha"]})
-    print("已推送 %d 个文件（%.1f KB）-> %s" % (len(tree), total / 1024.0,
-                                             commit["sha"][:8]))
+    print("已推送 %d 个文件、删除 %d 个（%.1f KB）-> %s"
+          % (len(tree) - len(rms), len(rms), total / 1024.0, commit["sha"][:8]))
 
 
 if __name__ == "__main__":

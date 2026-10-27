@@ -9,3 +9,10 @@ captures/
 *.apk
 *.aab
 *.keystore
+
+# 隐藏的本地/工具目录，一律不进仓库
+.workbuddy/
+.vscode/
+.fleet/
+**/.DS_Store
+*.log
