@@ -108,6 +108,16 @@ gradle assembleRelease   # 产物 app/build/outputs/apk/release/app-release.apk
 
 release 用的是 AGP 自带 debug 签名，可直接 `adb install`。
 
+### 推送前的本地体检（必跑，ghpush 自动带上）
+
+`tools/ghpush.py` 每次推送前会先跑 `tools/preflight.py`，不通过就不推。
+它静态检查那些"只有真机才能发现"的硬错误，例如：
+
+- **phdr 表必须落在某个 PT_LOAD 段内**（v0.1.1 就是踩了这个：重排脚本把 phdr 表
+  搬到文件末尾，bionic 报 `loaded phdr not in loadable segment`，so 加载即失败）
+- 每个 LOAD 段 `p_offset ≡ p_vaddr (mod 页大小)`
+- PT_DYNAMIC 偏移在 LOAD 内、NEEDED 依赖齐全、Manifest/资源 XML 合法等
+
 > 本机 `github.com` 不通（只有 `api.github.com` 通）时，`git push` 会失败，
 > 可以用仓库里的 `tools/ghpush.py`：它走 GitHub Git Data REST API 手动
 > `blob → tree → commit → ref`，效果和 push 一样。

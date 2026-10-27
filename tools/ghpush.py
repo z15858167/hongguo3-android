@@ -58,6 +58,12 @@ def req(method, path, payload=None, raw=False):
 
 
 def main():
+    # 推送前先做静态体检，不通过就不推（避免又一次"只有真机能发现问题"）
+    preflight = os.path.join(os.path.dirname(os.path.abspath(__file__)), 'preflight.py')
+    r = subprocess.run([sys.executable, preflight])
+    if r.returncode != 0:
+        sys.exit('preflight 未通过，已取消推送')
+
     argv = sys.argv[1:]
     rms = []
     if "--rm" in argv:

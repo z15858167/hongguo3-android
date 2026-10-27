@@ -7,10 +7,15 @@
   机型用 16 KB 页，加载这种 so 会直接失败。patchelf 的 --page-size 对已存在的
   LOAD 段不起作用（实测 0.18/0.19 都不动 p_align），所以只能自己搬。
 
-做法：
+做法（v2，修复了 v1 的致命回归）：
   不改变任何 vaddr（=> 运行时代码里的绝对地址、以及我们用的「基址 + 偏移」都不受影响），
-  只把每个 LOAD 段的**文件偏移**往后挪，使其满足 p_offset % 16384 == p_vaddr % 16384，
-  再把 p_align 改成 16384。段之间补 0。
+  只把需要挪的 LOAD 段的**文件偏移**向后挪，使其满足 p_offset % 16384 == p_vaddr % 16384，
+  再把 p_align 改成 16384。
+
+  v1 的致命 bug：把 program header 表也搬到了文件末尾。Android linker 要求
+  phdr 表必须落在某个 PT_LOAD 的文件范围内（否则报
+  "loaded phdr ... not in loadable segment"，so 加载即失败）。
+  v2 不再搬 phdr 表：它本来就在第一个 LOAD（偏移 0，无需挪）里，原地不动。
 
 用法: python3 tools/align16k.py libmetasec_ml.so [-o out.so]   不带 -o 则原地改
 """
@@ -66,43 +71,43 @@ def reAlign(blob):
     if not loads:
         sys.exit('没有 PT_LOAD')
 
-    def owner(off, size):
-        """这段文件偏移落在哪个 LOAD 里（都不在则返回 None）。"""
-        for p in loads:
-            if p.offset <= off < p.offset + p.filesz:
-                return p
-        return None
-
-    plan = []          # [(phdr, old_off, new_off), ...]
-    out = bytearray()
-    cursor = 0         # 已经拷到新文件的原文件位置
+    # ---- 计划：每个 LOAD 的新文件偏移（只增不减，且不与前面的段重叠）----
+    plan = []                       # [(phdr, old_off, new_off), ...]
+    prev_end = 0                    # 前一个 LOAD 在新文件里的结束位置
     for p in loads:
-        out.extend(blob[cursor:p.offset])
-        cursor = p.offset
         want = p.vaddr % PAGE
-        x = max(len(out), cursor)
-        x += (want - x) % PAGE
-        pad = x - len(out)
-        if pad:
-            out.extend(b'\x00' * pad)
-        data = blob[p.offset:p.offset + p.filesz]
-        if len(data) != p.filesz:
-            sys.exit('文件被截断：%s' % p.offset)
-        out.extend(data)
-        cursor = p.offset + p.filesz
-        plan.append((p, p.offset, x))
-    out.extend(blob[cursor:])
-    growth = len(out) - len(blob)
+        new = p.offset
+        if new % PAGE != want:
+            new = p.offset + ((want - p.offset) % PAGE)
+            if new < prev_end:
+                new += ((prev_end - new + PAGE - 1) // PAGE) * PAGE
+        plan.append((p, p.offset, new))
+        prev_end = max(prev_end, new + p.filesz)
 
-    def shifted(off):
+    # phdr 表必须仍落在某个 LOAD 的文件范围内（linker 硬性要求）
+    phoff, phsz = h['phoff'], h['phnum'] * h['phentsize']
+    if not any(new <= phoff and phoff + phsz <= new + p.filesz for p, _old, new in plan):
+        sys.exit('重排后 phdr 表(0x%x)不在任何 LOAD 段内，拒绝执行' % phoff)
+
+    def delta(off):
+        """文件位置 off 处的内容，因 LOAD 挪动而产生的位移。"""
+        d = 0
         for _p, old, new in plan:
-            if old <= off < old + _p.filesz:
-                return off + (new - old)
-        if off >= plan[-1][1] + plan[-1][0].filesz:
-            return off + growth
-        return off
+            if old <= off:
+                d += new - old
+        return d
 
-    # ---- 回写 program headers ----
+    # ---- 重建文件：段间插 0，段内容原样拷贝 ----
+    out = bytearray()
+    prev = 0
+    for p, old, new in plan:
+        out.extend(blob[prev:old])              # 两个 LOAD 之间的原有内容
+        out.extend(b'\x00' * (new - old))       # 补齐到新偏移
+        out.extend(blob[old:old + p.filesz])    # LOAD 内容原样
+        prev = old + p.filesz
+    out.extend(blob[prev:])                     # 段后的内容（节表等），整体右移
+
+    # ---- 回写 program headers（表本身的位置不动！）----
     for p in h['phdrs']:
         if p.type == PT_LOAD:
             for lp, old, new in plan:
@@ -111,57 +116,78 @@ def reAlign(blob):
                     p.align = PAGE
                     break
         elif p.offset:
-            p.offset = shifted(p.offset)
-    h['shoff'] = shifted(h['shoff'])
+            p.offset += delta(p.offset)
+
+    h['shoff'] += delta(h['shoff'])
     for s in h['shdrs']:
         if s.offset:
-            s.offset = shifted(s.offset)
+            s.offset += delta(s.offset)
 
-    new_phoff = len(out)
-    out.extend(b'\x00' * (len(h['phdrs']) * h['phentsize']))
-    new_shoff = len(out)
-    out.extend(b'\x00' * (len(h['shdrs']) * h['shentsize']))
+    # e_phoff 不改：phdr 表原地没动。e_shoff 改成新位置。
+    struct.pack_into('<Q', out, 0x28, h['shoff'])
 
+    # 把 phdr 表内容写回原位置（值变了：LOAD 的 offset/align、非 LOAD 的 offset）
     for i, p in enumerate(h['phdrs']):
-        struct.pack_into('<IIQQQQQQ', out, new_phoff + i * h['phentsize'],
+        struct.pack_into('<IIQQQQQQ', out, h['phoff'] + i * h['phentsize'],
                          p.type, p.flags, p.offset, p.vaddr, p.paddr,
                          p.filesz, p.memsz, p.align)
     for i, s in enumerate(h['shdrs']):
-        struct.pack_into('<IIQQQQIIQQ', out, new_shoff + i * h['shentsize'],
+        struct.pack_into('<IIQQQQIIQQ', out, h['shoff'] + i * h['shentsize'],
                          s.name, s.type, s.flags, s.addr, s.offset, s.size,
                          s.link, s.info, s.addralign, s.entsize)
 
-    struct.pack_into('<Q', out, 0x20, h['phoff'] and new_phoff)
-    struct.pack_into('<Q', out, 0x28, new_shoff)
+    growth = len(out) - len(blob)
     return bytes(out), plan, growth
 
 
-def verify(old, new, plan):
-    """逐节比对内容，确认搬运没把数据弄坏。"""
+def verify(old, new):
+    """逐项确认重排没有破坏任何东西，并满足 bionic linker 的硬性要求。"""
     a = parse(old)
     b = parse(new)
-    if len(a['phdrs']) != len(b['phdrs']) or len(a['shdrs']) != len(b['shdrs']):
-        return '段表/节表数量变了'
+
+    # 1) phdr 表位置不变，且在新文件里落在某个 LOAD 内
+    if a['phoff'] != b['phoff']:
+        return 'phdr 表位置被移动了（bionic 会拒绝加载）'
+    phend = b['phoff'] + b['phnum'] * b['phentsize']
+    inside = any(p.type == PT_LOAD and p.offset <= b['phoff'] and phend <= p.offset + p.filesz
+                 for p in b['phdrs'])
+    if not inside:
+        return 'phdr 表不在任何 LOAD 段内（bionic: loaded phdr not in loadable segment）'
+
+    # 2) 每个 LOAD：offset 与 vaddr 同余（mod 16384 也 mod 4096），vaddr 不变
     for pa, pb in zip(a['phdrs'], b['phdrs']):
         if (pa.type, pa.vaddr, pa.filesz, pa.memsz) != (pb.type, pb.vaddr, pb.filesz, pb.memsz):
-            return 'program header 内容变了: %s' % pa.type
+            return 'program header 内容变了: type=%s' % pa.type
         if pb.type == PT_LOAD:
             if pb.align != PAGE:
                 return 'p_align 没改成 16384'
             if pb.offset % PAGE != pb.vaddr % PAGE:
                 return 'p_offset 与 p_vaddr 不同余: 0x%x / 0x%x' % (pb.offset, pb.vaddr)
+
+    # 3) LOAD 在文件里按序且不重叠
+    ls = sorted([p for p in b['phdrs'] if p.type == PT_LOAD], key=lambda p: p.offset)
+    for x, y in zip(ls, ls[1:]):
+        if x.offset + x.filesz > y.offset:
+            return 'LOAD 段文件区间重叠'
+
+    # 4) 节内容逐一比对（NOBITS 与空节跳过）
     for sa, sb in zip(a['shdrs'], b['shdrs']):
         if (sa.type, sa.addr, sa.size, sa.name) != (sb.type, sb.addr, sb.size, sb.name):
             return '节表变了: %s' % sa.name
-        # SHT_NOBITS(.bss 等) 只占地址不占文件空间，比不了内容
         if sa.type == 8 or not sa.offset or not sa.size:
             continue
-        if min(sa.offset, sb.offset) + sa.size > min(len(old), len(new)):
+        if sb.offset + sa.size > len(new):
             return '节 %d 越界' % sa.name
-        da = old[sa.offset:sa.offset + sa.size]
-        db = new[sb.offset:sb.offset + sa.size]
-        if da != db:
+        if old[sa.offset:sa.offset + sa.size] != new[sb.offset:sb.offset + sa.size]:
             return '节 %d 内容和原来不一样' % sa.name
+
+    # 5) DYNAMIC 段的文件偏移必须落在某个 LOAD 内（运行时 linker 会经 vaddr 访问，其实
+    #    只依赖 vaddr，但保守起见检查偏移一致性）
+    for p in b['phdrs']:
+        if p.type == 2:  # PT_DYNAMIC
+            if not any(ld.type == PT_LOAD and ld.offset <= p.offset < ld.offset + ld.filesz
+                       for ld in b['phdrs'] if ld.type == PT_LOAD):
+                return 'PT_DYNAMIC 偏移不在 LOAD 内'
     return None
 
 
@@ -175,12 +201,12 @@ def main():
         dst = args[args.index('-o') + 1]
     blob = open(src, 'rb').read()
     new, plan, growth = reAlign(blob)
-    err = verify(blob, new, plan)
+    err = verify(blob, new)
     if err:
         sys.exit('校验失败，没有改动任何文件：%s' % err)
     for p, old, cur in plan:
         print('LOAD vaddr=0x%-8x offset 0x%x -> 0x%x' % (p.vaddr, old, cur))
-    print('文件增长 %d 字节，所有节内容与原文件一致' % growth)
+    print('文件增长 %d 字节，校验全部通过（phdr 原位、节内容一致、同余满足）' % growth)
     open(dst, 'wb').write(new)
 
 
