@@ -389,8 +389,14 @@ public final class Api {
         it.score = optStrAny(vdata, "score");
         if (it.score.isEmpty()) it.score = optStrAny(inner, "score");
         it.hot = optStrAny(vdata, "rec_text");
+        // 封面字段在不同接口的 cell 里位置不固定，按桌面版实测的优先级逐个兜底：
+        // video_data.cover → video_data.video_detail.series_cover → horiz_cover → 其它
         it.cover = optStrAny(vdata, "cover");
+        if (it.cover.isEmpty()) it.cover = optStrAny(inner, "series_cover");
+        if (it.cover.isEmpty()) it.cover = optStrAny(vdata, "horiz_cover");
         if (it.cover.isEmpty()) it.cover = optStrAny(inner, "cover");
+        if (it.cover.isEmpty()) it.cover = optStrAny(vd, "cover");
+        if (it.cover.isEmpty()) it.cover = optStrAny(vd, "series_cover");
         it.intro = cut(optStrAny(vdata, "video_desc"), 50);
         return it;
     }

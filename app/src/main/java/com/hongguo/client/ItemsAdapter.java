@@ -139,7 +139,11 @@ public class ItemsAdapter extends RecyclerView.Adapter<ItemsAdapter.Holder> {
         TextView t = new TextView(act);
         t.setTextSize(13);
         t.setTextColor(TXT);
-        t.setMaxLines(1);
+        // 剧名常常很长，两行显示（超出打省略号）；配合下面的 minLines 保证卡片高度一致
+        t.setMaxLines(2);
+        t.setMinLines(2);
+        t.setEllipsize(android.text.TextUtils.TruncateAt.END);
+        t.setLineSpacing(0, 1.05f);
         t.setPadding(dp(2), dp(6), dp(2), 0);
         card.addView(t);
 
