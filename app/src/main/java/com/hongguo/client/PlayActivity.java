@@ -4,20 +4,26 @@ import android.content.Context;
 import android.content.Intent;
 import android.graphics.Color;
 import android.graphics.drawable.GradientDrawable;
+import android.media.AudioManager;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.Handler;
+import android.os.Looper;
 import android.util.TypedValue;
 import android.view.Gravity;
+import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
 import android.widget.FrameLayout;
 import android.widget.LinearLayout;
 import android.widget.ScrollView;
+import android.widget.SeekBar;
 import android.widget.TextView;
 import android.widget.Toast;
 
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
+import androidx.core.view.GestureDetectorCompat;
 import androidx.media3.common.MediaItem;
 import androidx.media3.common.Player;
 import androidx.media3.exoplayer.ExoPlayer;
@@ -37,10 +43,13 @@ import java.util.List;
 import java.util.Set;
 
 /**
- * 播放页。链路：剧集详情 → 取轨道 → 下载密文 → 解密到本地 → ExoPlayer 播明文。
+ * 播放页。链路：剧集详情 → 取轨道 → 流式解密（边下边解）→ ExoPlayer 播放。
  *
- * 桌面版那套「虚拟明文 MP4 + Range 206」在这里不需要：那是为了骗浏览器 <video>，
- * 手机上直接解出一个明文文件更简单，也不需要本地 HTTP 服务。
+ * 播放器交互对齐国内视频 App（爱奇艺/腾讯视频）通用范式：
+ *  - 单击画面：显示/隐藏控制条；播放中 3.5s 自动隐藏；换集不弹出；
+ *  - 双击左侧/右侧：快退/快进 10s；双击中间：播放/暂停；
+ *  - 左半屏上下滑：亮度；右半屏上下滑：音量；横向滑：快进快退（实时预览）；
+ *  - 控制条：顶部（返回/标题/收藏/上一集/下一集）+ 底部（播放键/进度条/时间/全屏）。
  */
 public class PlayActivity extends AppCompatActivity {
 
@@ -60,13 +69,18 @@ public class PlayActivity extends AppCompatActivity {
 
     private ExoPlayer player;
     private PlayerView playerView;
-    private TextView status, favBtn, titleView, autoBtn, fsBtn;
-    private LinearLayout qBar, speedBar;
-    private LinearLayout top, panel;
+    private TextView status, autoBtn, oTitle;
+    private TextView oFav, oPlay, oCur, oDur, oFull, oBack, oPrev, oNext;
+    private LinearLayout qBar, speedBar, oTop, oBottom;
+    private SeekBar oSeek;
+    private TextView centerHint;
+    private LinearLayout panel;
     private FrameLayout stage;
     private RecyclerView epGrid;
     private EpAdapter epAdapter;
-    private View loading;
+
+    private final Handler ui = new Handler(Looper.getMainLooper());
+    private boolean controlsShown;
 
     private float speed = 1.0f;
     private boolean autoNext = true;
@@ -79,6 +93,17 @@ public class PlayActivity extends AppCompatActivity {
     private Model.Episode curEpObj;
     private int curStartSec;
     private boolean fullscreen;
+
+    // ---------------- 手势 ----------------
+    private static final int G_NONE = 0, G_SEEK = 1, G_BRIGHT = 2, G_VOL = 3;
+    private int gMode = G_NONE;
+    private float gDownX, gDownY;
+    private long gStartMs, gTargetMs;
+    private float gBaseBright;
+    private int gBaseVol, gMaxVol;
+    private AudioManager am;
+    private GestureDetectorCompat gd;
+    private float baseBrightness = -1f; // 进入页面时的系统亮度，退出时还原
 
     public static void start(Context c, String sid, String title, String cover) {
         Intent i = new Intent(c, PlayActivity.class);
@@ -98,7 +123,11 @@ public class PlayActivity extends AppCompatActivity {
             finish();
             return;
         }
+        am = (AudioManager) getSystemService(Context.AUDIO_SERVICE);
+        baseBrightness = getWindow().getAttributes().screenBrightness;
         setContentView(build());
+        gd = new GestureDetectorCompat(this, new Gestures());
+        playerView.setOnTouchListener((v, ev) -> onTouch(ev));
         try {
             Api.init(this);
         } catch (Exception e) {
@@ -112,85 +141,161 @@ public class PlayActivity extends AppCompatActivity {
                 getResources().getDisplayMetrics()));
     }
 
+    // ================= UI 构建 =================
     private View build() {
         LinearLayout root = new LinearLayout(this);
         root.setOrientation(LinearLayout.VERTICAL);
         root.setBackgroundColor(0xFF000000);
         root.setFitsSystemWindows(true);
 
-        top = new LinearLayout(this);
-        top.setOrientation(LinearLayout.HORIZONTAL);
-        top.setGravity(Gravity.CENTER_VERTICAL);
-        top.setPadding(dp(8), dp(6), dp(12), dp(6));
-        TextView back = new TextView(this);
-        back.setText("‹ 返回");
-        back.setTextSize(15);
-        back.setTextColor(TXT);
-        back.setPadding(dp(10), dp(8), dp(10), dp(8));
-        back.setOnClickListener(v -> finish());
-        top.addView(back);
+        stage = new FrameLayout(this);
+        stage.setBackgroundColor(Color.BLACK);
+        playerView = new PlayerView(this);
+        playerView.setBackgroundColor(Color.BLACK);
+        // 关键：不用 media3 默认 controller（YouTube 风格、换集自动弹出），
+        // 全部用下面的自定义顶栏/底栏 + 手势
+        playerView.setUseController(false);
+        stage.addView(playerView, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
 
-        titleView = new TextView(this);
-        titleView.setText(title == null ? "" : title);
-        titleView.setTextSize(15);
-        titleView.setTextColor(TXT);
-        titleView.setMaxLines(1);
-        titleView.setPadding(dp(6), 0, dp(6), 0);
-        top.addView(titleView, new LinearLayout.LayoutParams(0,
+        // ---- 顶部控制栏（默认隐藏，单击画面出现）----
+        oTop = new LinearLayout(this);
+        oTop.setOrientation(LinearLayout.HORIZONTAL);
+        oTop.setGravity(Gravity.CENTER_VERTICAL);
+        oTop.setBackground(new GradientDrawable() {{
+            setOrientation(GradientDrawable.Orientation.TOP_BOTTOM);
+            setColors(new int[]{0xB3000000, 0x00000000});
+        }});
+        oTop.setPadding(dp(6), dp(6), dp(10), dp(12));
+
+        oBack = tv("‹", 22, TXT);
+        oBack.setPadding(dp(10), dp(6), dp(10), dp(6));
+        oBack.setOnClickListener(v -> finish());
+        oTop.addView(oBack);
+
+        oTitle = new TextView(this);
+        oTitle.setText(title == null ? "" : title);
+        oTitle.setTextSize(14);
+        oTitle.setTextColor(TXT);
+        oTitle.setMaxLines(1);
+        oTitle.setPadding(dp(2), 0, dp(6), 0);
+        oTop.addView(oTitle, new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
-        favBtn = new TextView(this);
-        favBtn.setTextSize(17);
-        favBtn.setPadding(dp(10), dp(4), dp(4), dp(4));
-        favBtn.setOnClickListener(v -> {
+        oFav = tv("♡", 17, TXT);
+        oFav.setPadding(dp(10), dp(4), dp(10), dp(4));
+        oFav.setOnClickListener(v -> {
             boolean on = Store.toggleFav(this, sid, title, cover);
             syncFav();
             toast(on ? "已收藏" : "已取消收藏");
         });
-        top.addView(favBtn);
+        oTop.addView(oFav);
 
-        TextView prevBtn = new TextView(this);
-        prevBtn.setText("上一集");
-        prevBtn.setTextSize(12);
-        prevBtn.setTextColor(TXT);
-        prevBtn.setPadding(dp(6), dp(6), dp(6), dp(6));
-        prevBtn.setOnClickListener(v -> playPrev());
-        top.addView(prevBtn);
+        oPrev = tv("上一集", 12, TXT);
+        oPrev.setPadding(dp(8), dp(6), dp(4), dp(6));
+        oPrev.setOnClickListener(v -> playPrev());
+        oTop.addView(oPrev);
 
-        TextView nextBtn = new TextView(this);
-        nextBtn.setText("下一集");
-        nextBtn.setTextSize(12);
-        nextBtn.setTextColor(TXT);
-        nextBtn.setPadding(dp(10), dp(6), dp(6), dp(6));
-        nextBtn.setOnClickListener(v -> playNext());
-        top.addView(nextBtn);
+        oNext = tv("下一集", 12, TXT);
+        oNext.setPadding(dp(10), dp(6), dp(4), dp(6));
+        oNext.setOnClickListener(v -> playNext());
+        oTop.addView(oNext);
 
-        syncFav();
-        root.addView(top);
+        oTop.setVisibility(View.GONE);
+        stage.addView(oTop, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP));
 
-        stage = new FrameLayout(this);
-        playerView = new PlayerView(this);
-        playerView.setBackgroundColor(Color.BLACK);
-        playerView.setUseController(true);
-        // 控制条 2.5 秒自动隐藏、点一下再出来（默认常驻会一直盖在画面上）
-        playerView.setControllerShowTimeoutMs(2500);
-        playerView.setControllerHideOnTouch(true);
-        playerView.setControllerAutoShow(true);
-        stage.addView(playerView, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+        // ---- 底部控制栏 ----
+        oBottom = new LinearLayout(this);
+        oBottom.setOrientation(LinearLayout.VERTICAL);
+        oBottom.setBackground(new GradientDrawable() {{
+            setOrientation(GradientDrawable.Orientation.BOTTOM_TOP);
+            setColors(new int[]{0xCC000000, 0x00000000});
+        }});
+        oBottom.setPadding(dp(12), dp(16), dp(12), dp(6));
 
-        fsBtn = new TextView(this);
-        fsBtn.setText("\u23cf");
-        fsBtn.setTextSize(18);
-        fsBtn.setTextColor(0xFFFFFFFF);
-        fsBtn.setPadding(dp(10), dp(6), dp(10), dp(6));
-        fsBtn.setBackgroundColor(0x66000000);
-        fsBtn.setOnClickListener(v -> toggleFullscreen());
-        FrameLayout.LayoutParams fslp = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        fslp.gravity = Gravity.BOTTOM | Gravity.END;
-        fslp.setMargins(0, 0, dp(8), dp(8));
-        stage.addView(fsBtn, fslp);
+        LinearLayout seekRow = new LinearLayout(this);
+        seekRow.setOrientation(LinearLayout.HORIZONTAL);
+        seekRow.setGravity(Gravity.CENTER_VERTICAL);
+
+        oCur = tv("00:00", 11, TXT);
+        oCur.setPadding(0, 0, dp(8), 0);
+        seekRow.addView(oCur);
+
+        oSeek = new SeekBar(this);
+        oSeek.setMax(1000);
+        oSeek.getProgressDrawable().setColorFilter(PINK, android.graphics.PorterDuff.Mode.SRC_IN);
+        oSeek.getThumb().setColorFilter(PINK, android.graphics.PorterDuff.Mode.SRC_IN);
+        oSeek.setOnSeekBarChangeListener(new SeekBar.OnSeekBarChangeListener() {
+            @Override
+            public void onProgressChanged(SeekBar s, int p, boolean fromUser) {
+                if (fromUser && player != null && player.getDuration() > 0) {
+                    oCur.setText(fmtMs(p * player.getDuration() / 1000L));
+                }
+            }
+
+            @Override
+            public void onStartTrackingTouch(SeekBar s) {
+                ui.removeCallbacks(hideRun);
+            }
+
+            @Override
+            public void onStopTrackingTouch(SeekBar s) {
+                if (player != null && player.getDuration() > 0) {
+                    player.seekTo(s.getProgress() * player.getDuration() / 1000L);
+                }
+                scheduleHide();
+            }
+        });
+        seekRow.addView(oSeek, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        oDur = tv("00:00", 11, TXT);
+        oDur.setPadding(dp(8), 0, dp(6), 0);
+        seekRow.addView(oDur);
+
+        oFull = tv("全屏", 13, TXT);
+        oFull.setPadding(dp(8), dp(6), dp(4), dp(6));
+        oFull.setOnClickListener(v -> toggleFullscreen());
+        seekRow.addView(oFull);
+
+        oBottom.addView(seekRow);
+
+        LinearLayout bottomRow = new LinearLayout(this);
+        bottomRow.setOrientation(LinearLayout.HORIZONTAL);
+        bottomRow.setGravity(Gravity.CENTER_VERTICAL);
+
+        oPlay = tv("▶", 18, TXT);
+        oPlay.setPadding(dp(4), dp(6), dp(10), dp(6));
+        oPlay.setOnClickListener(v -> togglePlay());
+        bottomRow.addView(oPlay);
+
+        TextView spacer = new TextView(this);
+        bottomRow.addView(spacer, new LinearLayout.LayoutParams(0, 1, 1f));
+
+        // 连播开关放在下方面板（与清晰度/倍速/选集在一起），底部栏保持干净
+        TextView connHint = tv("清晰度 · 倍速 · 选集在下方", 11, 0x66FFFFFF);
+        bottomRow.addView(connHint);
+
+        oBottom.addView(bottomRow);
+        oBottom.setVisibility(View.GONE);
+        stage.addView(oBottom, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.BOTTOM));
+
+        // ---- 中央手势反馈 / 状态 ----
+        centerHint = tv("", 14, Color.WHITE);
+        centerHint.setGravity(Gravity.CENTER);
+        GradientDrawable hg = new GradientDrawable();
+        hg.setCornerRadius(dp(10));
+        hg.setColor(0x99000000);
+        centerHint.setBackground(hg);
+        centerHint.setPadding(dp(18), dp(12), dp(18), dp(12));
+        centerHint.setVisibility(View.GONE);
+        stage.addView(centerHint, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.CENTER));
 
         status = new TextView(this);
         status.setTextColor(0xCCFFFFFF);
@@ -204,7 +309,7 @@ public class PlayActivity extends AppCompatActivity {
 
         LinearLayout.LayoutParams stageLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0);
-        stageLp.weight = 42;
+        stageLp.weight = 45;
         root.addView(stage, stageLp);
 
         panel = new LinearLayout(this);
@@ -262,8 +367,7 @@ public class PlayActivity extends AppCompatActivity {
         ctrl.addView(speedBar, new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
-        autoBtn = new TextView(this);
-        autoBtn.setTextSize(12);
+        autoBtn = tv("", 12, DIM);
         autoBtn.setPadding(dp(12), dp(6), dp(12), dp(6));
         autoBtn.setOnClickListener(v -> {
             autoNext = !autoNext;
@@ -271,8 +375,6 @@ public class PlayActivity extends AppCompatActivity {
             toast(autoNext ? "已开启自动连播" : "已关闭自动连播");
         });
         ctrl.addView(autoBtn);
-        markSpeed();
-        markAuto();
         panel.addView(ctrl);
 
         TextView epLabel = new TextView(this);
@@ -291,16 +393,27 @@ public class PlayActivity extends AppCompatActivity {
 
         LinearLayout.LayoutParams panelLp = new LinearLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, 0);
-        panelLp.weight = 58;
+        panelLp.weight = 55;
         root.addView(panel, panelLp);
 
+        markSpeed();
+        markAuto();
+        syncFav();
         return root;
+    }
+
+    private TextView tv(String text, float sizeSp, int color) {
+        TextView t = new TextView(this);
+        t.setText(text);
+        t.setTextSize(sizeSp);
+        t.setTextColor(color);
+        return t;
     }
 
     private void syncFav() {
         boolean on = Store.isFav(this, sid);
-        favBtn.setText(on ? "♥" : "♡");
-        favBtn.setTextColor(on ? PINK : TXT);
+        oFav.setText(on ? "♥" : "♡");
+        oFav.setTextColor(on ? PINK : TXT);
     }
 
     private void setStatus(String s) {
@@ -314,7 +427,207 @@ public class PlayActivity extends AppCompatActivity {
         Toast.makeText(this, s, Toast.LENGTH_SHORT).show();
     }
 
-    // ---------------- 加载 ----------------
+    // ================= 控制条显隐 =================
+    private void showControls() {
+        ui.removeCallbacks(hideRun);
+        controlsShown = true;
+        oTop.setVisibility(View.VISIBLE);
+        oBottom.setVisibility(View.VISIBLE);
+        oFull.setText(fullscreen ? "退出全屏" : "全屏");
+        oTitle.setText(title == null ? "" : title);
+        tick();
+        scheduleHide();
+    }
+
+    private void hideControls() {
+        ui.removeCallbacks(hideRun);
+        controlsShown = false;
+        oTop.setVisibility(View.GONE);
+        oBottom.setVisibility(View.GONE);
+        centerHint.setVisibility(View.GONE);
+        ui.removeCallbacks(tickRun);
+    }
+
+    private void toggleControls() {
+        if (controlsShown) hideControls();
+        else showControls();
+    }
+
+    /** 只在播放中倒计时隐藏；暂停时保持显示（跟国内播放器一致）。 */
+    private void scheduleHide() {
+        ui.removeCallbacks(hideRun);
+        if (player != null && player.isPlaying()) {
+            ui.postDelayed(hideRun, 3500);
+        }
+    }
+
+    private final Runnable hideRun = this::hideControls;
+
+    private final Runnable tickRun = new Runnable() {
+        @Override
+        public void run() {
+            tick();
+        }
+    };
+
+    private void tick() {
+        ui.removeCallbacks(tickRun);
+        if (!controlsShown) return;
+        if (player != null) {
+            long dur = player.getDuration();
+            long pos = player.getCurrentPosition();
+            if (dur > 0) {
+                oSeek.setMax(1000);
+                oSeek.setProgress((int) (pos * 1000L / dur));
+                oDur.setText(fmtMs(dur));
+            }
+            oCur.setText(fmtMs(pos));
+            oPlay.setText(player.isPlaying() ? "❚❚" : "▶");
+        }
+        ui.postDelayed(tickRun, 500);
+        // 播放中续约隐藏计时
+        if (player != null && player.isPlaying()) {
+            ui.removeCallbacks(hideRun);
+            ui.postDelayed(hideRun, 3500);
+        }
+    }
+
+    private void togglePlay() {
+        if (player == null) return;
+        if (player.isPlaying()) {
+            player.pause();
+        } else {
+            player.play();
+        }
+        showControls();
+        scheduleHide();
+    }
+
+    private String fmtMs(long ms) {
+        if (ms < 0) ms = 0;
+        long s = ms / 1000;
+        return String.format("%02d:%02d", s / 60, s % 60);
+    }
+
+    // ================= 手势 =================
+    private boolean onTouch(MotionEvent ev) {
+        if (gd != null) gd.onTouchEvent(ev);
+        switch (ev.getActionMasked()) {
+            case MotionEvent.ACTION_DOWN:
+                gDownX = ev.getX();
+                gDownY = ev.getY();
+                gMode = G_NONE;
+                if (player != null && player.getDuration() > 0) {
+                    gStartMs = player.getCurrentPosition();
+                } else {
+                    gStartMs = 0;
+                }
+                return true;
+            case MotionEvent.ACTION_MOVE: {
+                float dx = ev.getX() - gDownX;
+                float dy = ev.getY() - gDownY;
+                if (gMode == G_NONE && Math.hypot(dx, dy) > dp(18)) {
+                    if (Math.abs(dx) > Math.abs(dy) && player != null
+                            && player.getDuration() > 0) {
+                        gMode = G_SEEK;
+                    } else if (ev.getX() < stage.getWidth() / 2f) {
+                        gMode = G_BRIGHT;
+                    } else {
+                        gMode = G_VOL;
+                    }
+                    gBaseBright = getWindow().getAttributes().screenBrightness;
+                    if (gBaseBright < 0) gBaseBright = 0.5f;
+                    if (am != null) {
+                        gBaseVol = am.getStreamVolume(AudioManager.STREAM_MUSIC);
+                        gMaxVol = am.getStreamMaxVolume(AudioManager.STREAM_MUSIC);
+                    } else {
+                        gBaseVol = 0;
+                        gMaxVol = 1;
+                    }
+                }
+                if (gMode == G_SEEK) {
+                    long dur = player.getDuration();
+                    float frac = dx / (stage.getWidth() * 0.75f);
+                    gTargetMs = gStartMs + (long) (frac * dur);
+                    if (gTargetMs < 0) gTargetMs = 0;
+                    if (gTargetMs > dur) gTargetMs = dur;
+                    long diff = gTargetMs - gStartMs;
+                    setHint((diff >= 0 ? "快进 " : "快退 ")
+                            + fmtMs(Math.abs(diff)) + "\n"
+                            + fmtMs(gTargetMs) + " / " + fmtMs(dur));
+                } else if (gMode == G_BRIGHT) {
+                    float delta = -dy / (stage.getHeight() * 0.75f);
+                    float v = Math.min(1f, Math.max(0.01f, gBaseBright + delta));
+                    android.view.WindowManager.LayoutParams lp = getWindow().getAttributes();
+                    lp.screenBrightness = v;
+                    getWindow().setAttributes(lp);
+                    setHint("亮度 " + Math.round(v * 100) + "%");
+                } else if (gMode == G_VOL) {
+                    float delta = -dy / (stage.getHeight() * 0.75f) * gMaxVol;
+                    int v = Math.min(gMaxVol, Math.max(0,
+                            Math.round(gBaseVol + delta)));
+                    if (v != am.getStreamVolume(AudioManager.STREAM_MUSIC)) {
+                        am.setStreamVolume(AudioManager.STREAM_MUSIC, v, 0);
+                    }
+                    setHint("音量 " + v + " / " + gMaxVol);
+                }
+                return true;
+            }
+            case MotionEvent.ACTION_UP:
+            case MotionEvent.ACTION_CANCEL:
+                if (gMode == G_SEEK && player != null && player.getDuration() > 0) {
+                    player.seekTo(gTargetMs);
+                    scheduleHide();
+                }
+                gMode = G_NONE;
+                centerHint.setVisibility(View.GONE);
+                return true;
+        }
+        return true;
+    }
+
+    private void setHint(String s) {
+        centerHint.setText(s);
+        centerHint.setVisibility(View.VISIBLE);
+    }
+
+    private class Gestures extends android.view.GestureDetector.SimpleOnGestureListener {
+        @Override
+        public boolean onSingleTapConfirmed(@NonNull MotionEvent e) {
+            toggleControls();
+            return true;
+        }
+
+        @Override
+        public boolean onDoubleTap(@NonNull MotionEvent e) {
+            if (player == null) return true;
+            float x = e.getX();
+            float w = playerView.getWidth();
+            if (x < w / 3f) {
+                long t = Math.max(0, player.getCurrentPosition() - 10000L);
+                player.seekTo(t);
+                setHint("« 10s");
+                ui.removeCallbacks(hintRun);
+                ui.postDelayed(hintRun, 600);
+            } else if (x > w * 2f / 3f) {
+                long t = player.getCurrentPosition() + 10000L;
+                if (player.getDuration() > 0 && t > player.getDuration()) {
+                    t = player.getDuration();
+                }
+                player.seekTo(t);
+                setHint("10s »");
+                ui.removeCallbacks(hintRun);
+                ui.postDelayed(hintRun, 600);
+            } else {
+                togglePlay();
+            }
+            return true;
+        }
+    }
+
+    private final Runnable hintRun = () -> centerHint.setVisibility(View.GONE);
+
+    // ================= 加载 =================
     private void loadDetail() {
         setStatus("正在获取剧集…");
         Api.run(() -> Api.episodes(sid), new Api.Cb<Model.Detail>() {
@@ -324,7 +637,7 @@ public class PlayActivity extends AppCompatActivity {
                 warmed.clear();
                 if (title == null || title.isEmpty()) {
                     title = v.title;
-                    titleView.setText(title);
+                    oTitle.setText(title);
                     syncFav();
                 }
                 epAdapter.set(v.eps);
@@ -337,7 +650,7 @@ public class PlayActivity extends AppCompatActivity {
             @Override
             public void err(Exception e) {
                 setStatus("获取剧集失败\n" + msg(e)
-                        + "\n\n如果是「空响应 / 签名未生效」，说明签名桥没跑起来，点右上角诊断看原因。");
+                        + "\n\n如果是「空响应 / 签名未生效」，说明签名桥没跑起来。");
             }
         });
     }
@@ -350,6 +663,8 @@ public class PlayActivity extends AppCompatActivity {
         }
         curEp = epIndex;
         epAdapter.highlight(curEp);
+        // 换集：控制条立刻收起，不再弹出（用户单击画面才会出现）
+        hideControls();
         setStatus("正在取播放地址…");
         Api.run(() -> Api.tracks(ep.vid), new Api.Cb<List<Model.Track>>() {
             @Override
@@ -492,8 +807,7 @@ public class PlayActivity extends AppCompatActivity {
     }
 
     /**
-     * 下一集预热：当前集出画后，后台把下一集下载 + 解密好。
-     * 这样"手点下一集"和"自动连播"都能秒开；只热一次，且最多同时进行 1 个。
+     * 下一集预热：当前集出画后，后台把下一集的密文缓存下来。
      */
     private final Set<String> warmed = Collections.synchronizedSet(new HashSet<>());
     private volatile boolean warming;
@@ -511,7 +825,6 @@ public class PlayActivity extends AppCompatActivity {
                 Model.Track pick = null;
                 for (Model.Track t : ts) if (pick == null || t.num() > pick.num()) pick = t;
                 if (pick != null) {
-                    // 现在走流式解密，预热只需把**密文**缓存下来即可（播放时现场解密）
                     File enc = new File(getCacheDir(), ep.vid + "." + safe(pick.definition) + ".enc");
                     if (!enc.exists() || enc.length() <= 1024) {
                         Api.download(pick.url, enc, null);
@@ -541,11 +854,7 @@ public class PlayActivity extends AppCompatActivity {
         return 0;
     }
 
-    // ---------------- 准备并播放 ----------------
-    /**
-     * 默认走**边下边解边播**（StreamSource）：只先取 256 KB 头拿样本表，随后边播边解密，
-     * 不用等整集下完。只有当源片不支持 Range / moov 不在头部时才回退到"整集下完再解"。
-     */
+    // ================= 准备并播放 =================
     private void prepare(Model.Episode ep, Model.Track t, int startSec) {
         String tag = ep.vid + "." + safe(t.definition);
         File plain = new File(getCacheDir(), tag + ".mp4");
@@ -607,6 +916,8 @@ public class PlayActivity extends AppCompatActivity {
             player.prepare();
             if (startSec > 0) player.seekTo(startSec * 1000L);
             player.setPlayWhenReady(true);
+            oSeek.setProgress(0);
+            oCur.setText("00:00");
         });
     }
 
@@ -663,13 +974,25 @@ public class PlayActivity extends AppCompatActivity {
         player.addListener(new Player.Listener() {
             @Override
             public void onPlaybackStateChanged(int state) {
-                if (state == Player.STATE_READY) status.setVisibility(View.GONE);
+                if (state == Player.STATE_READY) {
+                    status.setVisibility(View.GONE);
+                    oDur.setText(fmtMs(player.getDuration()));
+                    if (controlsShown) tick();
+                }
                 if (state != Player.STATE_ENDED) return;
                 if (autoNext) {
                     playNext();
                 } else if (detail != null) {
                     Store.recordHist(PlayActivity.this, sid, title, cover,
                             curEp, detail.episodeCnt, 0);
+                }
+            }
+
+            @Override
+            public void onIsPlayingChanged(boolean isPlaying) {
+                if (controlsShown) {
+                    oPlay.setText(isPlaying ? "❚❚" : "▶");
+                    scheduleHide();
                 }
             }
 
@@ -689,20 +1012,14 @@ public class PlayActivity extends AppCompatActivity {
         });
     }
 
-    // ---------------- 全屏 ----------------
+    // ================= 全屏 =================
     private void toggleFullscreen() {
         fullscreen = !fullscreen;
-        if (top != null) top.setVisibility(fullscreen ? View.GONE : View.VISIBLE);
+        hideControls(); // 切换后重新单击呼出，布局已变化
         if (panel != null) panel.setVisibility(fullscreen ? View.GONE : View.VISIBLE);
         if (stage != null) {
             LinearLayout.LayoutParams lp = (LinearLayout.LayoutParams) stage.getLayoutParams();
-            if (fullscreen) {
-                lp.height = 0;
-                lp.weight = 100;
-            } else {
-                lp.height = 0;
-                lp.weight = 42;
-            }
+            lp.weight = fullscreen ? 100 : 45;
             stage.setLayoutParams(lp);
         }
         if (fullscreen) {
@@ -723,7 +1040,6 @@ public class PlayActivity extends AppCompatActivity {
                 ic.show(androidx.core.view.WindowInsetsCompat.Type.systemBars());
             }
         }
-        fsBtn.setText(fullscreen ? "退出" : "全屏");
         toast(fullscreen ? "已进入全屏" : "已退出全屏");
     }
 
@@ -750,7 +1066,7 @@ public class PlayActivity extends AppCompatActivity {
         return s == null || s.isEmpty() ? e.toString() : s;
     }
 
-    // ---------------- 进度与生命周期 ----------------
+    // ================= 进度与生命周期 =================
     @Override
     protected void onPause() {
         super.onPause();
@@ -769,6 +1085,13 @@ public class PlayActivity extends AppCompatActivity {
 
     @Override
     protected void onDestroy() {
+        ui.removeCallbacksAndMessages(null);
+        // 还原进入时的系统亮度
+        if (baseBrightness >= 0) {
+            android.view.WindowManager.LayoutParams lp = getWindow().getAttributes();
+            lp.screenBrightness = baseBrightness;
+            getWindow().setAttributes(lp);
+        }
         if (stream != null) {
             stream.release();
             stream = null;
@@ -780,7 +1103,7 @@ public class PlayActivity extends AppCompatActivity {
         super.onDestroy();
     }
 
-    // ---------------- 选集 ----------------
+    // ================= 选集 =================
     private class EpAdapter extends RecyclerView.Adapter<EpHolder> {
         private final List<Model.Episode> data = new ArrayList<>();
 
