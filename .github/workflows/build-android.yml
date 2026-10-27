@@ -46,32 +46,10 @@ jobs:
                           "ndk;26.1.10909125" "cmake;3.22.1"
           ls "$SDK/ndk" || true
 
-      # 上游这份 so 是 4 KB 页对齐（align 2**12），Android 15 的 16 KB 页机型会拒绝加载。
-      # patchelf 能不动 vaddr 地把 p_align 抬到 16 KB：vaddr 不变 => 运行时的符号偏移也不变。
-      # 只在 CI 里改，仓库里的原始文件保持原样。
-      - name: 让 so 兼容 16KB 页（Android 15+）
-        run: |
-          SO=app/src/main/jniLibs/arm64-v8a/libmetasec_ml.so
-          cp "$SO" /tmp/metasec.orig.so
-          P=""
-          command -v patchelf >/dev/null 2>&1 && P=patchelf
-          # 系统自带的 patchelf 往往太旧（没有 --page-size），优先用 PyPI 的新版
-          if [ -z "$P" ]; then
-            python3 -m pip install --quiet --user patchelf >/dev/null 2>&1 || true
-            [ -x "$HOME/.local/bin/patchelf" ] && P="$HOME/.local/bin/patchelf"
-          fi
-          if [ -z "$P" ]; then
-            sudo apt-get update -qq >/dev/null 2>&1 && \
-              sudo apt-get install -y -qq patchelf >/dev/null 2>&1 || true
-            command -v patchelf >/dev/null 2>&1 && P=patchelf
-          fi
-          if [ -z "$P" ]; then
-            echo "没有 patchelf，跳过（4 KB 页机型不受影响）"
-          else
-            echo "patchelf: $("$P" --version 2>&1 | head -1)"
-            "$P" --page-size 16384 "$SO" || echo "patchelf 出错"
-            python3 check_align.py "$SO" || cp /tmp/metasec.orig.so "$SO"
-          fi
+      # so 已经在仓库里重排成 16 KB 页对齐（tools/align16k.py），这里只是复查一遍，
+      # 免得有人不小心把 4 KB 版的原文件覆盖回来（Android 15 的 16 KB 页机型会加载失败）。
+      - name: 校验 so 的 16KB 页对齐
+        run: python3 check_align.py app/src/main/jniLibs/arm64-v8a/libmetasec_ml.so
 
       - name: 配置 Gradle
         uses: gradle/actions/setup-gradle@v4

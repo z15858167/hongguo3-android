@@ -119,7 +119,11 @@ release 用的是 AGP 自带 debug 签名，可直接 `adb install`。
 ## 已知限制
 
 - 只编 `arm64-v8a`（so 只有这一份；x86 模拟器跑不了）
+- 仓库里的 `libmetasec_ml.so` 已经用 `tools/align16k.py` 重排成 16 KB 页对齐
+  （只挪文件偏移、vaddr 不动，运行时偏移不受影响），可覆盖 Android 15 的 16 KB 页机型；
+  注意 Google 官方那个 check 脚本要求 `p_offset` 整除 16384，本 so 第二段的 `p_vaddr`
+  本身不是 16384 的倍数，做不到 —— 但 linker 真正要求的是 `p_offset ≡ p_vaddr (mod 16384)`，
+  CI 用 `check_align.py` 按这个标准复查
 - 包名是 `com.hongguo.client`，与上游官方包名不同；若 so 内部有包名校验会签出空值 →
   首页右上角「诊断」可直接看签名状态
-- so 是 4 KB 页对齐，Android 15 的 16 KB 页机型可能加载失败
 - root / Frida 环境会触发反调试（`MS.b` 查调用栈），签名结果可能为空
