@@ -29,6 +29,25 @@ public final class Model {
         public int duration;
     }
 
+    /** 一页列表结果（分类浏览要翻页，所以带游标）。 */
+    public static class Page {
+        public final List<Item> items = new ArrayList<>();
+        public boolean hasMore;
+        public int nextOffset;
+    }
+
+    /** 分类筛选面板的一行，例如「主题」「设定」「排序」。 */
+    public static class FilterRow {
+        public String type = "";
+        public String name = "";
+        public final List<FilterItem> items = new ArrayList<>();
+    }
+
+    public static class FilterItem {
+        public String id = "";
+        public String name = "";
+    }
+
     public static class Detail {
         public String seriesId = "";
         public String title = "";

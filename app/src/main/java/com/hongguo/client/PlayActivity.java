@@ -19,10 +19,14 @@ import android.widget.Toast;
 import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
 import androidx.media3.common.MediaItem;
+import androidx.media3.common.Player;
 import androidx.media3.exoplayer.ExoPlayer;
 import androidx.media3.ui.PlayerView;
 import androidx.recyclerview.widget.GridLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
+
+import com.hongguo.client.cenc.Decryptor;
+import com.hongguo.client.cenc.Spade;
 
 import java.io.File;
 import java.util.ArrayList;
@@ -53,11 +57,15 @@ public class PlayActivity extends AppCompatActivity {
 
     private ExoPlayer player;
     private PlayerView playerView;
-    private TextView status, favBtn, titleView;
-    private LinearLayout qBar;
+    private TextView status, favBtn, titleView, autoBtn;
+    private LinearLayout qBar, speedBar;
     private RecyclerView epGrid;
     private EpAdapter epAdapter;
     private View loading;
+
+    private float speed = 1.0f;
+    private boolean autoNext = true;
+    private static final float[] SPEEDS = {0.75f, 1.0f, 1.25f, 1.5f, 2.0f};
 
     public static void start(Context c, String sid, String title, String cover) {
         Intent i = new Intent(c, PlayActivity.class);
@@ -128,6 +136,15 @@ public class PlayActivity extends AppCompatActivity {
             toast(on ? "已收藏" : "已取消收藏");
         });
         top.addView(favBtn);
+
+        TextView nextBtn = new TextView(this);
+        nextBtn.setText("下一集");
+        nextBtn.setTextSize(12);
+        nextBtn.setTextColor(TXT);
+        nextBtn.setPadding(dp(10), dp(6), dp(6), dp(6));
+        nextBtn.setOnClickListener(v -> playNext());
+        top.addView(nextBtn);
+
         syncFav();
         root.addView(top);
 
@@ -168,6 +185,58 @@ public class PlayActivity extends AppCompatActivity {
         qBar.setOrientation(LinearLayout.HORIZONTAL);
         qBar.setPadding(0, dp(6), 0, dp(8));
         panel.addView(qBar);
+
+        LinearLayout ctrl = new LinearLayout(this);
+        ctrl.setOrientation(LinearLayout.HORIZONTAL);
+        ctrl.setGravity(Gravity.CENTER_VERTICAL);
+        ctrl.setPadding(0, 0, 0, dp(8));
+
+        TextView spLabel = new TextView(this);
+        spLabel.setText("倍速");
+        spLabel.setTextSize(12);
+        spLabel.setTextColor(DIM);
+        spLabel.setPadding(0, 0, dp(8), 0);
+        ctrl.addView(spLabel);
+
+        speedBar = new LinearLayout(this);
+        speedBar.setOrientation(LinearLayout.HORIZONTAL);
+        for (float s : SPEEDS) {
+            final float fs = s;
+            TextView c = new TextView(this);
+            c.setText(fmtSpeed(s));
+            c.setTextSize(12);
+            c.setPadding(dp(9), dp(5), dp(9), dp(5));
+            c.setTag(s);
+            c.setOnClickListener(v -> {
+                speed = fs;
+                if (player != null) player.setPlaybackSpeed(fs);
+                markSpeed();
+            });
+            GradientDrawable g = new GradientDrawable();
+            g.setCornerRadius(dp(12));
+            g.setColor(0x22FFFFFF);
+            c.setBackground(g);
+            c.setTextColor(TXT);
+            LinearLayout.LayoutParams lp = new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+            lp.rightMargin = dp(6);
+            speedBar.addView(c, lp);
+        }
+        ctrl.addView(speedBar, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        autoBtn = new TextView(this);
+        autoBtn.setTextSize(12);
+        autoBtn.setPadding(dp(12), dp(6), dp(12), dp(6));
+        autoBtn.setOnClickListener(v -> {
+            autoNext = !autoNext;
+            markAuto();
+            toast(autoNext ? "已开启自动连播" : "已关闭自动连播");
+        });
+        ctrl.addView(autoBtn);
+        markSpeed();
+        markAuto();
+        panel.addView(ctrl);
 
         TextView epLabel = new TextView(this);
         epLabel.setText("选集");
@@ -309,6 +378,55 @@ public class PlayActivity extends AppCompatActivity {
         }
     }
 
+    private String fmtSpeed(float s) {
+        return (s == Math.round(s) ? String.valueOf((int) s) : String.valueOf(s)) + "x";
+    }
+
+    private void markSpeed() {
+        if (speedBar == null) return;
+        for (int i = 0; i < speedBar.getChildCount(); i++) {
+            TextView c = (TextView) speedBar.getChildAt(i);
+            boolean on = ((Float) c.getTag()) == speed;
+            c.setTextColor(on ? PINK : TXT);
+            GradientDrawable g = new GradientDrawable();
+            g.setCornerRadius(dp(12));
+            g.setColor(on ? 0x33FF2C55 : 0x22FFFFFF);
+            c.setBackground(g);
+        }
+    }
+
+    private void markAuto() {
+        if (autoBtn == null) return;
+        autoBtn.setText(autoNext ? "连播 开" : "连播 关");
+        autoBtn.setTextColor(autoNext ? PINK : DIM);
+        GradientDrawable g = new GradientDrawable();
+        g.setCornerRadius(dp(12));
+        g.setColor(autoNext ? 0x33FF2C55 : 0x22FFFFFF);
+        autoBtn.setBackground(g);
+    }
+
+    /** 自动连播：找当前集的下一集。 */
+    private void playNext() {
+        if (detail == null) return;
+        int next = Integer.MAX_VALUE;
+        for (Model.Episode e : detail.eps) {
+            if (e.index > curEp && e.index < next) next = e.index;
+        }
+        if (next == Integer.MAX_VALUE) {
+            toast("已经是最后一集");
+            return;
+        }
+        play(next, 0);
+        epGrid.scrollToPosition(indexOfEp(next));
+    }
+
+    private int indexOfEp(int epIndex) {
+        for (int i = 0; i < detail.eps.size(); i++) {
+            if (detail.eps.get(i).index == epIndex) return i;
+        }
+        return 0;
+    }
+
     // ---------------- 准备并播放 ----------------
     private void prepare(Model.Episode ep, Model.Track t, int startSec) {
         String tag = ep.vid + "." + safe(t.definition);
@@ -327,14 +445,14 @@ public class PlayActivity extends AppCompatActivity {
                         + (total > 0 ? "（" + (total / 1048576) + " MB）" : "")));
             });
             runOnUiThread(() -> status.setText("解密中…"));
-            String key = t.encrypted ? cenc.Spade.spadeToKey(t.spadeA) : null;
-            cenc.Decryptor.Stats st = cenc.Decryptor.decrypt(enc, plain, key, "full");
+            String key = t.encrypted ? Spade.spadeToKey(t.spadeA) : null;
+            Decryptor.Stats st = Decryptor.decrypt(enc, plain, key, "full");
             // 密文用完即删，省空间
             if (enc.exists()) enc.delete();
             return st;
-        }, new Api.Cb<cenc.Decryptor.Stats>() {
+        }, new Api.Cb<Decryptor.Stats>() {
             @Override
-            public void ok(cenc.Decryptor.Stats v) {
+            public void ok(Decryptor.Stats v) {
                 if (!plain.exists() || plain.length() < 1024) {
                     setStatus("解密失败：产物为空");
                     return;
@@ -352,8 +470,23 @@ public class PlayActivity extends AppCompatActivity {
     private void startPlay(File f, int startSec) {
         runOnUiThread(() -> {
             status.setVisibility(View.GONE);
-            if (player == null) player = new ExoPlayer.Builder(this).build();
+            if (player == null) {
+                player = new ExoPlayer.Builder(this).build();
+                player.addListener(new Player.Listener() {
+                    @Override
+                    public void onPlaybackStateChanged(int state) {
+                        if (state != Player.STATE_ENDED) return;
+                        if (autoNext) {
+                            playNext();
+                        } else if (detail != null) {
+                            Store.recordHist(PlayActivity.this, sid, title, cover,
+                                    curEp, detail.episodeCnt, 0);
+                        }
+                    }
+                });
+            }
             playerView.setPlayer(player);
+            player.setPlaybackSpeed(speed);
             player.setMediaItem(MediaItem.fromUri(Uri.fromFile(f)));
             player.prepare();
             if (startSec > 0) player.seekTo(startSec * 1000L);

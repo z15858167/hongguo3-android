@@ -18,10 +18,12 @@ import java.net.URL;
 import java.net.URLEncoder;
 import java.security.MessageDigest;
 import java.util.ArrayList;
+import java.util.HashSet;
 import java.util.Iterator;
 import java.util.LinkedHashMap;
 import java.util.List;
 import java.util.Map;
+import java.util.Set;
 import java.util.UUID;
 import java.util.concurrent.Callable;
 import java.util.concurrent.ExecutorService;
@@ -193,6 +195,40 @@ public final class Api {
         return http(method, url, h, data);
     }
 
+    private static boolean hasData(JSONObject j) {
+        return j != null && j.opt("data") != null && !JSONObject.NULL.equals(j.opt("data"));
+    }
+
+    /**
+     * 两种姿势都试：signedFirst=true 先签名、失败/无 data 再免签，反之亦然。
+     *
+     * 上游各接口的口径并不统一（实测）：
+     *   episodes  —— 免签返回空 body，必须签名
+     *   tracks    —— 免签正常，反而带错签名会返回 code=110001
+     *   rank      —— 免签可用
+     * 所以不要写死，统一走这里。
+     */
+    private static JSONObject requestEither(String method, String path, JSONObject body,
+                                            Map<String, String> extraQuery,
+                                            boolean signedFirst) throws Exception {
+        boolean[] order = signedFirst ? new boolean[]{true, false} : new boolean[]{false, true};
+        JSONObject last = null;
+        Exception err = null;
+        for (boolean s : order) {
+            try {
+                JSONObject j = request(method, path, body, extraQuery, s);
+                last = j;
+                if (hasData(j)) return j;
+            } catch (Exception e) {
+                if (err == null) err = e;
+                Log.d(TAG, (s ? "签名" : "免签") + " 请求 " + path + " 失败: " + e);
+            }
+        }
+        if (last != null) return last;
+        throw err != null ? err : new IOException("请求失败: " + path);
+    }
+
+
     // ---------------- 榜单 ----------------
     public static List<Model.Item> rank(String board, int limit) throws Exception {
         String sub = RANK_BOARDS.get(board);
@@ -212,7 +248,8 @@ public final class Api {
             q.put("session_uuid", sess);
             if (offset > 0) q.put("offset", String.valueOf(offset));
 
-            JSONObject j = request("GET", "/reading/bookapi/bookmall/cell/change/v", null, q, false);
+            JSONObject j = requestEither("GET", "/reading/bookapi/bookmall/cell/change/v",
+                    null, q, false);
             JSONObject data = j.optJSONObject("data");
             JSONObject cv = data == null ? null : data.optJSONObject("cell_view");
             JSONArray cells = cv == null ? null : cv.optJSONArray("cell_data");
@@ -252,8 +289,339 @@ public final class Api {
         return out.size() > limit ? new ArrayList<>(out.subList(0, limit)) : out;
     }
 
+    // ---------------- 搜索 ----------------
+    /**
+     * 搜索短剧。优先综合 tab（可翻页），接口停用或空结果时回退联想接口。
+     * 参照桌面版 search() / _search_suggest()。
+     */
+    public static List<Model.Item> search(String query, int limit) throws Exception {
+        List<Model.Item> out = new ArrayList<>();
+        try {
+            out = searchTab(query, limit);
+        } catch (Exception e) {
+            Log.d(TAG, "search/tab 不可用: " + e);
+        }
+        if (out.isEmpty()) out = searchSuggest(query, limit);
+        return out;
+    }
+
+    private static List<Model.Item> searchTab(String query, int limit) {
+        List<Model.Item> out = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        int offset = 0;
+        String passback = "";
+        String searchId = "";
+        for (int page = 0; page < 12 && out.size() < limit; page++) {
+            Map<String, String> q = new LinkedHashMap<>();
+            q.put("query", query);
+            q.put("tab_name", "feed");
+            q.put("search_source", "1");
+            q.put("offset", String.valueOf(offset));
+            q.put("count", "0");
+            q.put("use_correct", "true");
+            if (!passback.isEmpty()) q.put("passback", passback);
+            if (!searchId.isEmpty()) q.put("search_id", searchId);
+
+            JSONObject j;
+            try {
+                j = requestEither("GET", "/reading/bookapi/search/tab/v", null, q, true);
+            } catch (Exception e) {
+                return out;   // 接口停用 / 空 body：退出，交给 suggest 兜底
+            }
+            JSONArray tabs = j.optJSONArray("search_tabs");
+            if (tabs == null || tabs.length() == 0) return out;
+            JSONObject tab = tabs.optJSONObject(0);
+            if (tab == null) return out;
+            JSONArray data = tab.optJSONArray("data");
+            if (data == null || data.length() == 0) return out;
+
+            for (int i = 0; i < data.length(); i++) {
+                Model.Item it = parseSearchCell(data.optJSONObject(i));
+                if (it == null || !seen.add(it.seriesId)) continue;
+                out.add(it);
+                if (out.size() >= limit) break;
+            }
+            if (!tab.optBoolean("has_more", false)) return out;
+            int next = tab.optInt("next_offset", offset);
+            if (next == offset) return out;
+            offset = next;
+            passback = tab.optString("passback", passback);
+            searchId = tab.optString("search_id", searchId);
+        }
+        return out;
+    }
+
+    private static Model.Item parseSearchCell(JSONObject cell) {
+        if (cell == null) return null;
+        String sid = cell.optString("book_id", "");
+        if (sid.isEmpty()) sid = cell.optString("search_result_id", "");
+        if (sid.isEmpty()) return null;
+
+        JSONObject vd = cell.optJSONObject("video_detail");
+        JSONObject vdata = null;
+        Object raw = cell.opt("video_data");
+        if (raw instanceof JSONArray) {
+            JSONArray a = (JSONArray) raw;
+            if (a.length() > 0) vdata = a.optJSONObject(0);
+        } else if (raw instanceof JSONObject) {
+            vdata = (JSONObject) raw;
+        }
+        JSONObject inner = vdata == null ? null : vdata.optJSONObject("video_detail");
+
+        int ep = optIntAny(vd, "episode_cnt");
+        if (ep == 0) ep = optIntAny(vdata, "episode_cnt");
+        if (ep == 0) ep = optIntAny(inner, "episode_cnt");
+        if (ep == 0) return null;   // 只要短剧（有集数的）
+
+        Model.Item it = new Model.Item();
+        it.seriesId = sid;
+        JSONObject hl = cell.optJSONObject("search_high_light");
+        JSONObject hlTitle = hl == null ? null : hl.optJSONObject("title");
+        String title = hlTitle == null ? "" : stripTags(hlTitle.optString("text", ""));
+        if (title.isEmpty()) title = stripTags(optStrAny(vd, "series_title"));
+        if (title.isEmpty()) title = stripTags(optStrAny(vdata, "title"));
+        if (title.isEmpty()) title = stripTags(optStrAny(inner, "series_title"));
+        it.title = title;
+        it.episodeCnt = ep;
+        it.score = optStrAny(vdata, "score");
+        if (it.score.isEmpty()) it.score = optStrAny(inner, "score");
+        it.hot = optStrAny(vdata, "rec_text");
+        it.cover = optStrAny(vdata, "cover");
+        if (it.cover.isEmpty()) it.cover = optStrAny(inner, "cover");
+        it.intro = cut(optStrAny(vdata, "video_desc"), 50);
+        return it;
+    }
+
+    /** 联想接口兜底：2026-10 起 search/tab 对客户端返回空 body，suggest 仍可用。 */
+    private static List<Model.Item> searchSuggest(String query, int limit) throws Exception {
+        Map<String, String> q = new LinkedHashMap<>();
+        q.put("query", query);
+        JSONObject j = requestEither("GET", "/reading/bookapi/search/suggest/v", null, q, true);
+        JSONObject data = j.optJSONObject("data");
+        JSONArray items = data == null ? null : data.optJSONArray("query_result_v2");
+        if (items == null && data != null) items = data.optJSONArray("query_result");
+
+        List<Model.Item> out = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        if (items == null) return out;
+        for (int i = 0; i < items.length() && out.size() < limit; i++) {
+            JSONObject it = items.optJSONObject(i);
+            if (it == null) continue;
+            JSONObject vd = it.optJSONObject("video_data");
+            String sid = vd == null ? "" : vd.optString("series_id", "");
+            if (sid.isEmpty() && it.optInt("word_type", 0) == 2) {
+                String kw = it.optString("keyword", "").trim();
+                if (!kw.isEmpty() && kw.matches("[0-9]+")) sid = kw;
+            }
+            String title = stripTags(it.optString("name", ""));
+            if (title.isEmpty() && vd != null) title = stripTags(vd.optString("title", ""));
+            if (sid.isEmpty() || title.isEmpty() || !seen.add(sid)) continue;
+
+            Model.Item m = new Model.Item();
+            m.seriesId = sid;
+            m.title = title;
+            m.episodeCnt = vd == null ? 0 : vd.optInt("episode_cnt", 0);
+            m.score = vd == null ? "" : vd.optString("score", "");
+            m.cover = vd == null ? "" : vd.optString("cover", "");
+            if (m.cover.isEmpty()) m.cover = it.optString("pic_url", "");
+            m.hot = vd == null ? it.optString("sug_abstract", "") : "";
+            m.intro = cut(vd != null ? vd.optString("video_desc", "")
+                    : it.optString("sug_abstract", ""), 50);
+            out.add(m);
+        }
+        return out;
+    }
+
+    // ---------------- 分类 / 筛选 ----------------
+    private static final String[][] GENRES = {
+            {"short_play", "短剧"},
+            {"comic_series", "漫剧"},
+            {"ai_series", "AI短剧"},
+    };
+
+    public static String genreName(String genre) {
+        for (String[] g : GENRES) if (g[0].equals(genre)) return g[1];
+        return "短剧";
+    }
+
+    /** 体裁的实时筛选面板：主题/设定/背景/排序/受众/时间/状态。 */
+    public static List<Model.FilterRow> filters(String genre) {
+        JSONObject sel = new JSONObject();
+        try {
+            sel.put("category_dim_epoch", new JSONArray());
+            sel.put("online_time", new JSONArray());
+            sel.put("gender", new JSONArray());
+            sel.put("category_dim_role", new JSONArray());
+            JSONArray g = new JSONArray();
+            g.put(genre);
+            sel.put("genre", g);
+            sel.put("sort", new JSONArray());
+            sel.put("category_dim_theme", new JSONArray());
+
+            JSONObject body = new JSONObject();
+            body.put("filter_ids", "");
+            body.put("req_scene", genre);
+            body.put("offset", 0);
+            body.put("limit", 1);
+            body.put("need_selector_panel", true);
+            body.put("req_type", "default");
+            body.put("client_req_type", 3);
+            body.put("select_items", sel);
+            body.put("session_id", "");
+
+            JSONObject j = requestEither("POST", "/reading/distribution/category/landpage/v",
+                    body, null, true);
+            JSONObject data = j.optJSONObject("data");
+            JSONArray rows = data == null ? null : data.optJSONArray("selector_rows");
+            List<Model.FilterRow> out = new ArrayList<>();
+            if (rows == null) return out;
+            for (int i = 0; i < rows.length(); i++) {
+                JSONObject r = rows.optJSONObject(i);
+                if (r == null) continue;
+                Model.FilterRow row = new Model.FilterRow();
+                row.type = r.optString("type", "");
+                row.name = r.optString("row_name", "");
+                JSONArray its = r.optJSONArray("items");
+                if (its != null) {
+                    for (int k = 0; k < its.length(); k++) {
+                        JSONObject o = its.optJSONObject(k);
+                        if (o == null) continue;
+                        Model.FilterItem fi = new Model.FilterItem();
+                        fi.id = o.optString("selector_item_id", "");
+                        fi.name = o.optString("show_name", "");
+                        if (!fi.id.isEmpty() && !fi.name.isEmpty()) row.items.add(fi);
+                    }
+                }
+                if (!row.items.isEmpty()) out.add(row);
+            }
+            return out;
+        } catch (Exception e) {
+            Log.d(TAG, "filters 失败: " + e);
+            return new ArrayList<>();
+        }
+    }
+
+    /**
+     * 按筛选浏览。sel 的 key 是 select_items 的键（genre / category_dim_theme /
+     * category_dim_role / category_dim_epoch / sort / gender / online_time / creation_status），
+     * value 是 id 列表。shown 是本轮已经出现过的 series_id（上游用它去重，也当作游标）。
+     */
+    public static Model.Page browse(String genre, Map<String, List<String>> sel,
+                                    List<String> shown) throws Exception {
+        JSONObject select = new JSONObject();
+        try {
+            select.put("category_dim_epoch", arr(sel.get("category_dim_epoch")));
+            select.put("online_time", arr(sel.get("online_time")));
+            select.put("gender", arr(sel.get("gender")));
+            select.put("category_dim_role", arr(sel.get("category_dim_role")));
+            select.put("genre", arr(sel.get("genre")));
+            select.put("sort", arr(sel.get("sort")));
+            select.put("category_dim_theme", arr(sel.get("category_dim_theme")));
+            if (sel.containsKey("creation_status")) {
+                select.put("creation_status", arr(sel.get("creation_status")));
+            }
+
+            JSONObject body = new JSONObject();
+            body.put("filter_ids", joinIds(shown));
+            body.put("req_scene", genre);
+            body.put("offset", shown == null ? 0 : shown.size());
+            body.put("need_selector_panel", false);
+            body.put("limit", 18);
+            body.put("select_items", select);
+            body.put("session_id", "");
+            body.put("req_type", "only_content");
+            body.put("client_req_type", 3);
+
+            JSONObject j = requestEither("POST", "/reading/distribution/category/landpage/v",
+                    body, null, true);
+            Model.Page page = new Model.Page();
+            JSONObject data = j.optJSONObject("data");
+            if (data == null) return page;
+            JSONArray items = data.optJSONArray("video_data");
+            if (items != null) {
+                for (int i = 0; i < items.length(); i++) {
+                    Model.Item it = parseListItem(items.optJSONObject(i));
+                    if (it != null) page.items.add(it);
+                }
+            }
+            page.hasMore = data.optBoolean("has_more", true);
+            page.nextOffset = (shown == null ? 0 : shown.size()) + page.items.size();
+            return page;
+        } catch (Exception e) {
+            throw e;
+        }
+    }
+
+    private static JSONArray arr(List<String> v) {
+        JSONArray a = new JSONArray();
+        if (v != null) for (String s : v) a.put(s);
+        return a;
+    }
+
+    private static String joinIds(List<String> ids) {
+        if (ids == null || ids.isEmpty()) return "";
+        StringBuilder sb = new StringBuilder();
+        for (String s : ids) {
+            if (s == null || s.isEmpty()) continue;
+            if (sb.length() > 0) sb.append(',');
+            sb.append(s);
+        }
+        return sb.toString();
+    }
+
+    /** category/landpage、cell/change 里的条目结构基本一致。 */
+    private static Model.Item parseListItem(JSONObject it) {
+        if (it == null) return null;
+        String sid = it.optString("series_id", "");
+        if (sid.isEmpty()) sid = it.optString("book_id", "");
+        if (sid.isEmpty()) return null;
+        Model.Item m = new Model.Item();
+        m.seriesId = sid;
+        m.title = stripTags(it.optString("title", ""));
+        m.episodeCnt = it.optInt("episode_cnt", 0);
+        m.score = it.optString("score", "");
+        m.playCnt = it.optLong("play_cnt", 0);
+        m.cover = it.optString("cover", "");
+        m.intro = cut(it.optString("video_desc", ""), 50);
+        String cat = categories(it.optString("category_schema", ""));
+        m.hot = cat;
+        return m;
+    }
+
+    /** category_schema 里抽出分类名，拼成「玄幻 / 逆袭」。 */
+    private static String categories(String schema) {
+        if (schema == null || schema.isEmpty()) return "";
+        java.util.regex.Matcher mt = java.util.regex.Pattern
+                .compile("\"name\"\\s*:\\s*\"([^\"]+)\"").matcher(schema);
+        List<String> out = new ArrayList<>();
+        while (mt.find()) {
+            String n = mt.group(1);
+            if (!n.isEmpty() && !out.contains(n)) out.add(n);
+        }
+        StringBuilder sb = new StringBuilder();
+        for (String n : out) {
+            if (sb.length() > 0) sb.append(" / ");
+            sb.append(n);
+        }
+        return sb.toString();
+    }
+
+    private static String stripTags(String s) {
+        if (s == null) return "";
+        return s.replaceAll("<[^>]+>", "").trim();
+    }
+
+    private static int optIntAny(JSONObject o, String k) {
+        return o == null ? 0 : o.optInt(k, 0);
+    }
+
+    private static String optStrAny(JSONObject o, String k) {
+        return o == null ? "" : o.optString(k, "");
+    }
+
     // ---------------- 剧集详情 ----------------
     private static JSONObject episodeBody(String seriesId) throws Exception {
+
         JSONObject biz = new JSONObject();
         biz.put("detail_page_version", 0);
         biz.put("disable_digg_stat", false);
@@ -273,7 +641,7 @@ public final class Api {
     }
 
     public static Model.Detail episodes(String seriesId) throws Exception {
-        JSONObject j = request("POST", "/novel/player/multi_video_detail/v1/",
+        JSONObject j = requestEither("POST", "/novel/player/multi_video_detail/v1/",
                 episodeBody(seriesId), null, true);
         JSONObject data = j.optJSONObject("data");
         JSONObject one = data == null ? null : data.optJSONObject(seriesId);
@@ -327,7 +695,7 @@ public final class Api {
         body.put("biz_param", biz);
         body.put("mixed_video_id_map", map);
 
-        JSONObject j = request("POST", "/novel/player/multi_video_model/v1/", body, null, true);
+        JSONObject j = requestEither("POST", "/novel/player/multi_video_model/v1/", body, null, false);
         JSONObject data = j.optJSONObject("data");
         JSONObject one = data == null ? null : data.optJSONObject(vid);
         String vm = one == null ? null : one.optString("video_model", null);
