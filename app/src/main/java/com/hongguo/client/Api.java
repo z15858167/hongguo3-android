@@ -87,6 +87,9 @@ public final class Api {
         sessionHeaders = cfg.optJSONObject("session_headers");
         if (baseQuery == null) baseQuery = new JSONObject();
         if (sessionHeaders == null) sessionHeaders = new JSONObject();
+        // 只挂 Context，**不**在这里 loadLibrary：so 的加载留给第一次真正签名时
+        // （跑在 Api 的工作线程上），避免开屏时在主线程 dlopen 造成卡顿。
+        com.bytedance.mobsec.metasec.ml.MS.init(ctx);
     }
 
     private static String enc(String v) {

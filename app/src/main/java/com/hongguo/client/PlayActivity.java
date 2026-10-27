@@ -31,7 +31,9 @@ import com.hongguo.client.cenc.Spade;
 import java.io.File;
 import java.util.ArrayList;
 import java.util.Collections;
+import java.util.HashSet;
 import java.util.List;
+import java.util.Set;
 
 /**
  * 播放页。链路：剧集详情 → 取轨道 → 下载密文 → 解密到本地 → ExoPlayer 播明文。
@@ -136,6 +138,14 @@ public class PlayActivity extends AppCompatActivity {
             toast(on ? "已收藏" : "已取消收藏");
         });
         top.addView(favBtn);
+
+        TextView prevBtn = new TextView(this);
+        prevBtn.setText("上一集");
+        prevBtn.setTextSize(12);
+        prevBtn.setTextColor(TXT);
+        prevBtn.setPadding(dp(6), dp(6), dp(6), dp(6));
+        prevBtn.setOnClickListener(v -> playPrev());
+        top.addView(prevBtn);
 
         TextView nextBtn = new TextView(this);
         nextBtn.setText("下一集");
@@ -284,6 +294,7 @@ public class PlayActivity extends AppCompatActivity {
             @Override
             public void ok(Model.Detail v) {
                 detail = v;
+                warmed.clear();
                 if (title == null || title.isEmpty()) {
                     title = v.title;
                     titleView.setText(title);
@@ -405,19 +416,98 @@ public class PlayActivity extends AppCompatActivity {
         autoBtn.setBackground(g);
     }
 
-    /** 自动连播：找当前集的下一集。 */
-    private void playNext() {
-        if (detail == null) return;
+    private int nextOf() {
         int next = Integer.MAX_VALUE;
         for (Model.Episode e : detail.eps) {
             if (e.index > curEp && e.index < next) next = e.index;
         }
-        if (next == Integer.MAX_VALUE) {
+        return next == Integer.MAX_VALUE ? -1 : next;
+    }
+
+    private int prevOf() {
+        int prev = -1;
+        for (Model.Episode e : detail.eps) {
+            if (e.index < curEp && e.index > prev) prev = e.index;
+        }
+        return prev;
+    }
+
+    /** 自动连播 / 手动下一集。 */
+    private void playNext() {
+        if (detail == null) return;
+        int next = nextOf();
+        if (next < 0) {
             toast("已经是最后一集");
             return;
         }
         play(next, 0);
-        epGrid.scrollToPosition(indexOfEp(next));
+        scrollToEp(next);
+    }
+
+    private void playPrev() {
+        if (detail == null) return;
+        int prev = prevOf();
+        if (prev < 0) {
+            toast("已经是第一集");
+            return;
+        }
+        play(prev, 0);
+        scrollToEp(prev);
+    }
+
+    private void scrollToEp(int epIndex) {
+        if (epGrid == null) return;
+        epGrid.post(() -> {
+            int p = indexOfEp(epIndex);
+            RecyclerView l = epGrid;
+            if (l.getLayoutManager() != null) l.getLayoutManager().scrollToPosition(p);
+        });
+    }
+
+    /**
+     * 下一集预热：当前集出画后，后台把下一集下载 + 解密好。
+     * 这样"手点下一集"和"自动连播"都能秒开；只热一次，且最多同时进行 1 个。
+     */
+    private final Set<String> warmed = Collections.synchronizedSet(new HashSet<>());
+    private volatile boolean warming;
+
+    private void warmNext() {
+        if (detail == null || warming) return;
+        int next = nextOf();
+        if (next < 0) return;
+        Model.Episode ep = detail.ep(next);
+        if (ep == null || !warmed.add(ep.vid)) return;
+        warming = true;
+        Api.run(() -> {
+            try {
+                List<Model.Track> ts = Api.tracks(ep.vid);
+                Model.Track pick = null;
+                for (Model.Track t : ts) if (pick == null || t.num() > pick.num()) pick = t;
+                if (pick != null) {
+                    File plain = new File(getCacheDir(), ep.vid + "." + safe(pick.definition) + ".mp4");
+                    if (!plain.exists() || plain.length() <= 1024) {
+                        File enc = new File(getCacheDir(), ep.vid + "." + safe(pick.definition) + ".enc");
+                        Api.download(pick.url, enc, null);
+                        String key = pick.encrypted ? Spade.spadeToKey(pick.spadeA) : null;
+                        Decryptor.decrypt(enc, plain, key, "full");
+                        if (enc.exists()) enc.delete();
+                    }
+                }
+            } catch (Throwable ignored) {
+                // 预热失败不影响正在播的这一集
+            } finally {
+                warming = false;
+            }
+            return null;
+        }, new Api.Cb<Object>() {
+            @Override
+            public void ok(Object v) {
+            }
+
+            @Override
+            public void err(Exception e) {
+            }
+        });
     }
 
     private int indexOfEp(int epIndex) {
@@ -491,6 +581,8 @@ public class PlayActivity extends AppCompatActivity {
             player.prepare();
             if (startSec > 0) player.seekTo(startSec * 1000L);
             player.setPlayWhenReady(true);
+            // 出画之后在后台热下一集，别抢首帧的带宽
+            if (autoNext) warmNext();
         });
     }
 

@@ -159,6 +159,10 @@ public final class Store {
         save(c, K_HIST, new ArrayList<Rec>());
     }
 
+    public static void clearFav(Context c) {
+        save(c, K_FAV, new ArrayList<Rec>());
+    }
+
     /** 某部剧上次看到第几集、第几秒。 */
     public static int[] progress(Context c, String sid) {
         for (Rec r : hists(c)) {

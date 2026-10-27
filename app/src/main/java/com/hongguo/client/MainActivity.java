@@ -37,6 +37,7 @@ public class MainActivity extends AppCompatActivity {
     private RecyclerView grid;
     private ProgressBar bar;
     private TextView empty;
+    private TextView clearBtn;
     private ItemsAdapter adapter;
     private String cur = "recommend";
     private boolean loaded;
@@ -92,6 +93,9 @@ public class MainActivity extends AppCompatActivity {
                 new android.content.Intent(this, SearchActivity.class))));
         top.addView(action("分类", v -> startActivity(
                 new android.content.Intent(this, BrowseActivity.class))));
+        clearBtn = action("清空", v -> clearCurrent());
+        clearBtn.setVisibility(View.GONE);
+        top.addView(clearBtn);
         top.addView(action("诊断", v -> showDiag()));
         root.addView(top);
 
@@ -161,8 +165,26 @@ public class MainActivity extends AppCompatActivity {
         return t;
     }
 
+    private void clearCurrent() {
+        boolean fav = "fav".equals(cur);
+        String what = fav ? "收藏" : "观看历史";
+        new AlertDialog.Builder(this)
+                .setTitle("清空" + what)
+                .setMessage("确定要清空全部" + what + "吗？此操作不能撤销。")
+                .setNegativeButton("取消", null)
+                .setPositiveButton("清空", (d, w) -> {
+                    if (fav) Store.clearFav(this);
+                    else Store.clearHist(this);
+                    load();
+                    toast("已清空" + what);
+                })
+                .show();
+    }
+
     private void select(int idx) {
         cur = BOARDS[idx];
+        clearBtn.setVisibility(("fav".equals(cur) || "hist".equals(cur))
+                ? View.VISIBLE : View.GONE);
         for (int i = 0; i < tabBar.getChildCount(); i++) {
             TextView t = (TextView) tabBar.getChildAt(i);
             boolean on = i == idx;
