@@ -49,7 +49,7 @@ jobs:
       # so 已经在仓库里重排成 16 KB 页对齐（tools/align16k.py），这里只是复查一遍，
       # 免得有人不小心把 4 KB 版的原文件覆盖回来（Android 15 的 16 KB 页机型会加载失败）。
       - name: 校验 so 的 16KB 页对齐
-        run: python3 check_align.py app/src/main/jniLibs/arm64-v8a/libmetasec_ml.so
+        run: python3 tools/check_align.py app/src/main/jniLibs/arm64-v8a/libmetasec_ml.so
 
       - name: 配置 Gradle
         uses: gradle/actions/setup-gradle@v4
