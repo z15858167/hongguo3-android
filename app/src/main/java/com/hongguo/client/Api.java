@@ -294,18 +294,127 @@ public final class Api {
 
     // ---------------- 搜索 ----------------
     /**
-     * 搜索短剧。优先综合 tab（可翻页），接口停用或空结果时回退联想接口。
-     * 参照桌面版 search() / _search_suggest()。
+     * 搜索短剧。优先级与桌面版 server.api_search 一致：
+     * 官网网页版接口（全量 + 每条都有真封面、免签）> App 综合 tab > App 联想接口。
+     *
+     * 为什么官网接口排第一（桌面版 2026-10 实测结论）：
+     *  - /reading/bookapi/search/tab/v 已下线，返回空 body；
+     *  - /reading/bookapi/search/suggest/v 硬上限 10 条，只有前 1~2 条带 video_data，
+     *    其余 pic_url 是同一张灰色占位图 —— 这就是"搜出一堆但只有前几个有封面"的根因。
      */
     public static List<Model.Item> search(String query, int limit) throws Exception {
         List<Model.Item> out = new ArrayList<>();
         try {
-            out = searchTab(query, limit);
+            out = webSearch(query, limit);
         } catch (Exception e) {
-            Log.d(TAG, "search/tab 不可用: " + e);
+            Log.d(TAG, "官网搜索不可用: " + e);
+        }
+        if (out.isEmpty()) {
+            try {
+                out = searchTab(query, limit);
+            } catch (Exception e) {
+                Log.d(TAG, "search/tab 不可用: " + e);
+            }
         }
         if (out.isEmpty()) out = searchSuggest(query, limit);
         return out;
+    }
+
+    // ---- 官网网页版搜索：GET /api/search/result，免签、约 200ms、每页 10 条 ----
+    private static final String WEB_BASE = "https://hongguoduanju.com";
+    private static final String WEB_AID = "8662";
+    private static final String WEB_UA = "Mozilla/5.0 (Macintosh; Intel Mac OS X 10_15_7) "
+            + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
+
+    private static List<Model.Item> webSearch(String query, int limit) throws Exception {
+        List<Model.Item> out = new ArrayList<>();
+        Set<String> seen = new HashSet<>();
+        for (int page = 1; page <= 8 && out.size() < limit; page++) {
+            String url = WEB_BASE + "/api/search/result?aid=" + WEB_AID
+                    + "&query=" + URLEncoder.encode(query, "UTF-8")
+                    + "&page=" + page;
+            JSONObject j;
+            try {
+                j = webGet(url);
+            } catch (Exception e) {
+                // 某一页挂了（官网偶发 502）就停止翻页，已有的结果照常返回
+                Log.d(TAG, "官网搜索第 " + page + " 页失败: " + e);
+                break;
+            }
+            JSONArray lst = j.optJSONArray("searchList");
+            if (lst == null || lst.length() == 0) break;
+            for (int i = 0; i < lst.length() && out.size() < limit; i++) {
+                Model.Item it = parseWebCell(lst.optJSONObject(i));
+                if (it == null || !seen.add(it.seriesId)) continue;
+                out.add(it);
+            }
+            if (!j.optBoolean("hasMore", false)) break;
+        }
+        return out;
+    }
+
+    private static Model.Item parseWebCell(JSONObject x) {
+        if (x == null) return null;
+        JSONObject vd = x.optJSONObject("video_data");
+        if (vd == null) return null;
+        String sid = vd.optString("series_id", "");
+        if (sid.isEmpty()) return null;
+        String title = stripTags(vd.optString("series_title", ""));
+        if (title.isEmpty()) title = stripTags(x.optString("name", ""));
+        if (title.isEmpty()) return null;
+
+        Model.Item it = new Model.Item();
+        it.seriesId = sid;
+        it.title = title;
+        it.episodeCnt = vd.optInt("episode_cnt", 0);
+        it.cover = vd.optString("series_cover", "");   // 官网给的是竖版真封面
+        JSONObject hs = vd.optJSONObject("hot_score_data");
+        it.hot = hs == null ? "" : hs.optString("text", "");
+        if (it.hot.isEmpty()) it.hot = vd.optString("episode_right_text", "");
+        it.score = vd.optString("score", "");
+        it.intro = cut(stripTags(vd.optString("series_intro", "")), 50);
+        return it;
+    }
+
+    /** 官网接口偶发 502 / 空 body（翻页快时更明显），带退避重试。 */
+    private static JSONObject webGet(String url) throws Exception {
+        String last = "未知";
+        for (int i = 0; i < 4; i++) {
+            HttpURLConnection c = null;
+            try {
+                c = (HttpURLConnection) new URL(url).openConnection();
+                c.setConnectTimeout(12000);
+                c.setReadTimeout(12000);
+                c.setRequestProperty("User-Agent", WEB_UA);
+                c.setRequestProperty("Accept", "application/json, text/plain, */*");
+                c.setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9");
+                c.setRequestProperty("Referer", WEB_BASE + "/");
+                c.setRequestProperty("Origin", WEB_BASE);
+                if (c.getResponseCode() == 200) {
+                    String s = slurp(c.getInputStream());
+                    if (s != null && !s.trim().isEmpty()) return new JSONObject(s);
+                    last = "空body";
+                } else {
+                    last = "HTTP " + c.getResponseCode();
+                }
+            } catch (Exception e) {
+                last = e.toString();
+            } finally {
+                if (c != null) c.disconnect();
+            }
+            Thread.sleep(200L * (i + 1));
+        }
+        throw new IOException("官网搜索失败(" + last + ")");
+    }
+
+    private static String slurp(InputStream in) throws IOException {
+        if (in == null) return "";
+        ByteArrayOutputStream bo = new ByteArrayOutputStream();
+        byte[] buf = new byte[8192];
+        int n;
+        while ((n = in.read(buf)) > 0) bo.write(buf, 0, n);
+        in.close();
+        return new String(bo.toByteArray(), "UTF-8");
     }
 
     private static List<Model.Item> searchTab(String query, int limit) {

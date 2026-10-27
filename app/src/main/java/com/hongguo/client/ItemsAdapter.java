@@ -41,6 +41,8 @@ public class ItemsAdapter extends RecyclerView.Adapter<ItemsAdapter.Holder> {
     private final boolean showFav;
     private OnOpen onOpen;
     private OnFav onFav;
+    /** 剧名显示行数：列表页 2 行，搜索页 3 行（剧名普遍很长）。 */
+    private int titleLines = 2;
 
     public ItemsAdapter(Activity act) {
         this(act, true);
@@ -49,6 +51,11 @@ public class ItemsAdapter extends RecyclerView.Adapter<ItemsAdapter.Holder> {
     public ItemsAdapter(Activity act, boolean showFav) {
         this.act = act;
         this.showFav = showFav;
+    }
+
+    /** 必须在 set() 之前调用（onCreateViewHolder 时生效）。 */
+    public void setTitleLines(int n) {
+        this.titleLines = Math.max(1, n);
     }
 
     public void setOnOpen(OnOpen l) {
@@ -139,9 +146,9 @@ public class ItemsAdapter extends RecyclerView.Adapter<ItemsAdapter.Holder> {
         TextView t = new TextView(act);
         t.setTextSize(13);
         t.setTextColor(TXT);
-        // 剧名常常很长，两行显示（超出打省略号）；配合下面的 minLines 保证卡片高度一致
-        t.setMaxLines(2);
-        t.setMinLines(2);
+        // 剧名常常很长，多行显示（超出打省略号）；配合 minLines 保证卡片高度一致
+        t.setMaxLines(titleLines);
+        t.setMinLines(titleLines);
         t.setEllipsize(android.text.TextUtils.TruncateAt.END);
         t.setLineSpacing(0, 1.05f);
         t.setPadding(dp(2), dp(6), dp(2), 0);

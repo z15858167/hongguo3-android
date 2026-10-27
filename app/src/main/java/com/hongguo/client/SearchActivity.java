@@ -107,6 +107,7 @@ public class SearchActivity extends AppCompatActivity {
         grid.setClipToPadding(false);
         grid.setPadding(dp(10), dp(2), dp(10), dp(24));
         adapter = new ItemsAdapter(this);
+        adapter.setTitleLines(3);   // 搜索结果剧名普遍很长，3 行显示
         adapter.setOnOpen(it -> PlayActivity.start(this, it.seriesId, it.title, it.cover));
         adapter.setOnFav((it, now) -> toast(now ? "已收藏" : "已取消收藏"));
         grid.setAdapter(adapter);
