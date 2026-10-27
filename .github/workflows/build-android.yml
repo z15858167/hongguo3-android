@@ -47,10 +47,11 @@ jobs:
                           "ndk;26.1.10909125" "cmake;3.22.1"
           ls "$SDK/ndk" || true
 
-      # so 已经在仓库里重排成 16 KB 页对齐（tools/align16k.py），这里只是复查一遍，
-      # 免得有人不小心把 4 KB 版的原文件覆盖回来（Android 15 的 16 KB 页机型会加载失败）。
-      - name: 校验 so 的 16KB 页对齐
-        run: python3 tools/check_align.py app/src/main/jniLibs/arm64-v8a/libmetasec_ml.so
+      # 静态体检：phdr 表必须在 LOAD 段内（bionic 硬性要求，v0.1.1 踩过坑）、
+      # 每个 LOAD 的 p_offset ≡ p_vaddr (mod 各自 p_align)、打包后 APK 里的 so 也复查。
+      # 4 KB 对齐的原始 so 和 16 KB 重排后的 so 都能过（按各自 p_align 查）。
+      - name: 静态体检（preflight）
+        run: python3 tools/preflight.py
 
       - name: 配置 Gradle
         uses: gradle/actions/setup-gradle@v4
