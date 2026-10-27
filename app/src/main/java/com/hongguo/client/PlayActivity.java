@@ -26,6 +26,7 @@ import androidx.recyclerview.widget.GridLayoutManager;
 import androidx.recyclerview.widget.RecyclerView;
 
 import com.hongguo.client.cenc.Decryptor;
+import com.hongguo.client.cenc.StreamSource;
 import com.hongguo.client.cenc.Spade;
 
 import java.io.File;
@@ -59,8 +60,10 @@ public class PlayActivity extends AppCompatActivity {
 
     private ExoPlayer player;
     private PlayerView playerView;
-    private TextView status, favBtn, titleView, autoBtn;
+    private TextView status, favBtn, titleView, autoBtn, fsBtn;
     private LinearLayout qBar, speedBar;
+    private LinearLayout top, panel;
+    private FrameLayout stage;
     private RecyclerView epGrid;
     private EpAdapter epAdapter;
     private View loading;
@@ -68,6 +71,14 @@ public class PlayActivity extends AppCompatActivity {
     private float speed = 1.0f;
     private boolean autoNext = true;
     private static final float[] SPEEDS = {0.75f, 1.0f, 1.25f, 1.5f, 2.0f};
+
+    // 流式播放（边下边解）相关
+    private StreamSource stream;
+    private boolean fellBack;
+    private Model.Track curTrack;
+    private Model.Episode curEpObj;
+    private int curStartSec;
+    private boolean fullscreen;
 
     public static void start(Context c, String sid, String title, String cover) {
         Intent i = new Intent(c, PlayActivity.class);
@@ -107,11 +118,10 @@ public class PlayActivity extends AppCompatActivity {
         root.setBackgroundColor(0xFF000000);
         root.setFitsSystemWindows(true);
 
-        LinearLayout top = new LinearLayout(this);
+        top = new LinearLayout(this);
         top.setOrientation(LinearLayout.HORIZONTAL);
         top.setGravity(Gravity.CENTER_VERTICAL);
         top.setPadding(dp(8), dp(6), dp(12), dp(6));
-
         TextView back = new TextView(this);
         back.setText("‹ 返回");
         back.setTextSize(15);
@@ -158,12 +168,29 @@ public class PlayActivity extends AppCompatActivity {
         syncFav();
         root.addView(top);
 
-        FrameLayout stage = new FrameLayout(this);
+        stage = new FrameLayout(this);
         playerView = new PlayerView(this);
         playerView.setBackgroundColor(Color.BLACK);
         playerView.setUseController(true);
+        // 控制条 2.5 秒自动隐藏、点一下再出来（默认常驻会一直盖在画面上）
+        playerView.setControllerShowTimeoutMs(2500);
+        playerView.setControllerHideOnTouch(true);
+        playerView.setControllerAutoShow(true);
         stage.addView(playerView, new FrameLayout.LayoutParams(
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
+
+        fsBtn = new TextView(this);
+        fsBtn.setText("\u23cf");
+        fsBtn.setTextSize(18);
+        fsBtn.setTextColor(0xFFFFFFFF);
+        fsBtn.setPadding(dp(10), dp(6), dp(10), dp(6));
+        fsBtn.setBackgroundColor(0x66000000);
+        fsBtn.setOnClickListener(v -> toggleFullscreen());
+        FrameLayout.LayoutParams fslp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        fslp.gravity = Gravity.BOTTOM | Gravity.END;
+        fslp.setMargins(0, 0, dp(8), dp(8));
+        stage.addView(fsBtn, fslp);
 
         status = new TextView(this);
         status.setTextColor(0xCCFFFFFF);
@@ -180,7 +207,7 @@ public class PlayActivity extends AppCompatActivity {
         stageLp.weight = 42;
         root.addView(stage, stageLp);
 
-        LinearLayout panel = new LinearLayout(this);
+        panel = new LinearLayout(this);
         panel.setOrientation(LinearLayout.VERTICAL);
         panel.setBackgroundColor(0xFF121216);
         panel.setPadding(dp(12), dp(10), dp(12), 0);
@@ -484,13 +511,10 @@ public class PlayActivity extends AppCompatActivity {
                 Model.Track pick = null;
                 for (Model.Track t : ts) if (pick == null || t.num() > pick.num()) pick = t;
                 if (pick != null) {
-                    File plain = new File(getCacheDir(), ep.vid + "." + safe(pick.definition) + ".mp4");
-                    if (!plain.exists() || plain.length() <= 1024) {
-                        File enc = new File(getCacheDir(), ep.vid + "." + safe(pick.definition) + ".enc");
+                    // 现在走流式解密，预热只需把**密文**缓存下来即可（播放时现场解密）
+                    File enc = new File(getCacheDir(), ep.vid + "." + safe(pick.definition) + ".enc");
+                    if (!enc.exists() || enc.length() <= 1024) {
                         Api.download(pick.url, enc, null);
-                        String key = pick.encrypted ? Spade.spadeToKey(pick.spadeA) : null;
-                        Decryptor.decrypt(enc, plain, key, "full");
-                        if (enc.exists()) enc.delete();
                     }
                 }
             } catch (Throwable ignored) {
@@ -518,16 +542,80 @@ public class PlayActivity extends AppCompatActivity {
     }
 
     // ---------------- 准备并播放 ----------------
+    /**
+     * 默认走**边下边解边播**（StreamSource）：只先取 256 KB 头拿样本表，随后边播边解密，
+     * 不用等整集下完。只有当源片不支持 Range / moov 不在头部时才回退到"整集下完再解"。
+     */
     private void prepare(Model.Episode ep, Model.Track t, int startSec) {
         String tag = ep.vid + "." + safe(t.definition);
         File plain = new File(getCacheDir(), tag + ".mp4");
         if (plain.exists() && plain.length() > 1024) {
-            startPlay(plain, startSec);
+            startPlayFile(plain, startSec);
             return;
         }
         File enc = new File(getCacheDir(), tag + ".enc");
 
-        setStatus("下载中 0%");
+        setStatus("正在打开…");
+        Api.run(() -> {
+            String key = t.encrypted ? Spade.spadeToKey(t.spadeA) : null;
+            return new Object[]{key};
+        }, new Api.Cb<Object[]>() {
+            @Override
+            public void ok(Object[] v) {
+                startStream(t, (String) v[0], enc, startSec, ep);
+            }
+
+            @Override
+            public void err(Exception e) {
+                setStatus("取密钥失败\n" + msg(e));
+            }
+        });
+    }
+
+    /** 流式播放：ExoPlayer 要多少解多少。 */
+    private void startStream(Model.Track t, String key, File enc, int startSec, Model.Episode ep) {
+        if (stream != null) {
+            stream.release();
+            stream = null;
+        }
+        StreamSource src = new StreamSource(t.url, key, enc, "full",
+                (done, total, doneAll) -> {
+                    if (doneAll) return;
+                    runOnUiThread(() -> {
+                        if (status.getVisibility() == View.VISIBLE) {
+                            status.setText("缓冲中 " + (done / 1048576) + " / "
+                                    + (total > 0 ? total / 1048576 : 0) + " MB");
+                        }
+                    });
+                });
+        stream = src;
+        fellBack = false;
+        curTrack = t;
+        curEpObj = ep;
+        curStartSec = startSec;
+        runOnUiThread(() -> {
+            status.setVisibility(View.VISIBLE);
+            status.setText("正在打开…");
+            if (player == null) buildPlayer();
+            playerView.setPlayer(player);
+            player.setPlaybackSpeed(speed);
+            androidx.media3.exoplayer.source.ProgressiveMediaSource ms =
+                    new androidx.media3.exoplayer.source.ProgressiveMediaSource.Factory(
+                            () -> src)
+                            .createMediaSource(MediaItem.fromUri(Uri.parse(t.url)));
+            player.setMediaSource(ms);
+            player.prepare();
+            if (startSec > 0) player.seekTo(startSec * 1000L);
+            player.setPlayWhenReady(true);
+        });
+    }
+
+    /** 流式播不了（不支持 Range / moov 在尾部）时的兜底：整集下完再解密。 */
+    private void fallbackDownload(Model.Episode ep, Model.Track t, int startSec) {
+        String tag = ep.vid + "." + safe(t.definition);
+        File plain = new File(getCacheDir(), tag + ".mp4");
+        File enc = new File(getCacheDir(), tag + ".enc");
+        setStatus("该片不支持边下边播，整集下载中 0%");
         Api.run(() -> {
             Api.download(t.url, enc, (done, total) -> {
                 int pct = total > 0 ? (int) (done * 100L / total) : 0;
@@ -537,7 +625,6 @@ public class PlayActivity extends AppCompatActivity {
             runOnUiThread(() -> status.setText("解密中…"));
             String key = t.encrypted ? Spade.spadeToKey(t.spadeA) : null;
             Decryptor.Stats st = Decryptor.decrypt(enc, plain, key, "full");
-            // 密文用完即删，省空间
             if (enc.exists()) enc.delete();
             return st;
         }, new Api.Cb<Decryptor.Stats>() {
@@ -547,7 +634,7 @@ public class PlayActivity extends AppCompatActivity {
                     setStatus("解密失败：产物为空");
                     return;
                 }
-                startPlay(plain, startSec);
+                startPlayFile(plain, startSec);
             }
 
             @Override
@@ -557,33 +644,96 @@ public class PlayActivity extends AppCompatActivity {
         });
     }
 
-    private void startPlay(File f, int startSec) {
+    /** 播放已解密好的本地明文（回退路径 / 旧缓存）。 */
+    private void startPlayFile(File f, int startSec) {
         runOnUiThread(() -> {
             status.setVisibility(View.GONE);
-            if (player == null) {
-                player = new ExoPlayer.Builder(this).build();
-                player.addListener(new Player.Listener() {
-                    @Override
-                    public void onPlaybackStateChanged(int state) {
-                        if (state != Player.STATE_ENDED) return;
-                        if (autoNext) {
-                            playNext();
-                        } else if (detail != null) {
-                            Store.recordHist(PlayActivity.this, sid, title, cover,
-                                    curEp, detail.episodeCnt, 0);
-                        }
-                    }
-                });
-            }
+            if (player == null) buildPlayer();
             playerView.setPlayer(player);
             player.setPlaybackSpeed(speed);
             player.setMediaItem(MediaItem.fromUri(Uri.fromFile(f)));
             player.prepare();
             if (startSec > 0) player.seekTo(startSec * 1000L);
             player.setPlayWhenReady(true);
-            // 出画之后在后台热下一集，别抢首帧的带宽
-            if (autoNext) warmNext();
         });
+    }
+
+    private void buildPlayer() {
+        player = new ExoPlayer.Builder(this).build();
+        player.addListener(new Player.Listener() {
+            @Override
+            public void onPlaybackStateChanged(int state) {
+                if (state == Player.STATE_READY) status.setVisibility(View.GONE);
+                if (state != Player.STATE_ENDED) return;
+                if (autoNext) {
+                    playNext();
+                } else if (detail != null) {
+                    Store.recordHist(PlayActivity.this, sid, title, cover,
+                            curEp, detail.episodeCnt, 0);
+                }
+            }
+
+            @Override
+            public void onPlayerError(androidx.media3.common.PlaybackException error) {
+                // 流式路径起不来（不支持 Range / moov 在尾部等）→ 回退到整集下载再解密
+                if (stream != null && !fellBack && curTrack != null && curEpObj != null) {
+                    fellBack = true;
+                    stream.release();
+                    stream = null;
+                    setStatus("边下边播失败，改为整集下载\n" + msg(error));
+                    fallbackDownload(curEpObj, curTrack, curStartSec);
+                } else {
+                    setStatus("播放失败\n" + msg(error));
+                }
+            }
+        });
+    }
+
+    // ---------------- 全屏 ----------------
+    private void toggleFullscreen() {
+        fullscreen = !fullscreen;
+        if (top != null) top.setVisibility(fullscreen ? View.GONE : View.VISIBLE);
+        if (panel != null) panel.setVisibility(fullscreen ? View.GONE : View.VISIBLE);
+        if (stage != null) {
+            LinearLayout.LayoutParams lp = (LinearLayout.LayoutParams) stage.getLayoutParams();
+            if (fullscreen) {
+                lp.height = 0;
+                lp.weight = 100;
+            } else {
+                lp.height = 0;
+                lp.weight = 42;
+            }
+            stage.setLayoutParams(lp);
+        }
+        if (fullscreen) {
+            setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_SENSOR_LANDSCAPE);
+        } else {
+            setRequestedOrientation(android.content.pm.ActivityInfo.SCREEN_ORIENTATION_UNSPECIFIED);
+        }
+        androidx.core.view.WindowInsetsControllerCompat ic =
+                androidx.core.view.ViewCompat.getWindowInsetsController(
+                        getWindow().getDecorView());
+        if (ic != null) {
+            if (fullscreen) {
+                ic.hide(androidx.core.view.WindowInsetsCompat.Type.systemBars());
+                ic.setSystemBarsBehavior(
+                        androidx.core.view.WindowInsetsControllerCompat
+                                .BEHAVIOR_SHOW_TRANSIENT_BARS_BY_SWIPE);
+            } else {
+                ic.show(androidx.core.view.WindowInsetsCompat.Type.systemBars());
+            }
+        }
+        fsBtn.setText(fullscreen ? "退出" : "全屏");
+        toast(fullscreen ? "已进入全屏" : "已退出全屏");
+    }
+
+    @Override
+    public void onBackPressed() {
+        if (fullscreen) {
+            toggleFullscreen();
+            return;
+        }
+        super.onBackPressed();
     }
 
     private String safe(String s) {
@@ -619,6 +769,10 @@ public class PlayActivity extends AppCompatActivity {
 
     @Override
     protected void onDestroy() {
+        if (stream != null) {
+            stream.release();
+            stream = null;
+        }
         if (player != null) {
             player.release();
             player = null;

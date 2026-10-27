@@ -30,7 +30,13 @@ public final class Ctr {
      */
     public void decrypt(long ivHi, byte[] buf, int off, int len, int rel) throws GeneralSecurityException {
         if (len <= 0) return;
-        int blk = rel / 16;
+        /*
+         * 注意：块号必须用 long 参与移位。
+         * Java 对 int 的移位距离会取模 32，`blk >>> 32`（int）等于 `blk >>> 0`，
+         * 也就是 blk 本身 —— 那样 high 会被多加一个 blk，IV 直接错。
+         * 整文件解密（rel=0，blk=0）恰好躲过这个坑，只有按区间解密（rel>=16）才会暴露。
+         */
+        long blk = (long) rel / 16;
         int skip = rel % 16;
         long low = blk & 0xffffffffL;
         long high = (ivHi + (blk >>> 32)) & 0xffffffffffffffffL;
