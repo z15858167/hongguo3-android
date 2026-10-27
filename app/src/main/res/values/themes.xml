@@ -1,0 +1,21 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <style name="Theme.Hongguo" parent="Theme.AppCompat.Light.NoActionBar">
+        <item name="colorPrimary">#FF2C55</item>
+        <item name="colorAccent">#FF2C55</item>
+        <item name="android:windowBackground">#F6F6F8</item>
+        <item name="android:statusBarColor">#FFFFFF</item>
+        <item name="android:navigationBarColor">#FFFFFF</item>
+        <item name="android:windowLightStatusBar">true</item>
+    </style>
+
+    <style name="Theme.Hongguo.Player" parent="Theme.AppCompat.NoActionBar">
+        <item name="colorPrimary">#FF2C55</item>
+        <item name="colorAccent">#FF2C55</item>
+        <item name="android:windowBackground">#000000</item>
+        <item name="android:statusBarColor">#000000</item>
+        <item name="android:navigationBarColor">#000000</item>
+    </style>
+
+</resources>

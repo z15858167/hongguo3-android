@@ -1,0 +1,32 @@
+{
+ "api_host": "api5-normal-sinfonlinea.fqnovel.com",
+ "base_query": {
+  "iid": "4223674528611611",
+  "device_id": "4223674528607515",
+  "aid": "8662",
+  "app_name": "novelread",
+  "version_code": "72232",
+  "version_name": "7.2.2.32",
+  "channel": "google_market",
+  "device_platform": "android",
+  "device_type": "Pixel 5",
+  "device_brand": "Google",
+  "os_version": "12",
+  "os_api": "31",
+  "update_version_code": "72232",
+  "manifest_version_code": "72232",
+  "resolution": "1080*2340",
+  "dpi": "440",
+  "language": "zh",
+  "rom_version": "12",
+  "cdid": "8f7c33a2-1f4b-4c6a-9d2e-5b8a7c1e3f90",
+  "klink_egdi": "0"
+ },
+ "session_headers": {
+  "user-agent": "com.phoenix.read/72232 (Linux; U; Android 12; zh_CN; Pixel 5; Build/SQ3A.220705.004; tt-ok/3.12.13.20)",
+  "x-tt-store-region": "cn-sh",
+  "x-tt-store-region-src": "uid",
+  "passport-sdk-version": "5051452",
+  "sdk-version": "2"
+ }
+}
