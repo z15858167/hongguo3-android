@@ -53,20 +53,24 @@ jobs:
         run: |
           SO=app/src/main/jniLibs/arm64-v8a/libmetasec_ml.so
           cp "$SO" /tmp/metasec.orig.so
-          installed=no
-          command -v patchelf >/dev/null 2>&1 && installed=yes
-          if [ "$installed" != "yes" ]; then
-            if sudo apt-get update -qq >/dev/null 2>&1 && sudo apt-get install -y -qq patchelf >/dev/null 2>&1; then
-              installed=yes
-            fi
+          P=""
+          command -v patchelf >/dev/null 2>&1 && P=patchelf
+          # 系统自带的 patchelf 往往太旧（没有 --page-size），优先用 PyPI 的新版
+          if [ -z "$P" ]; then
+            python3 -m pip install --quiet --user patchelf >/dev/null 2>&1 || true
+            [ -x "$HOME/.local/bin/patchelf" ] && P="$HOME/.local/bin/patchelf"
           fi
-          done=no
-          if [ "$installed" = "yes" ] && patchelf --page-size 16384 "$SO" 2>/dev/null; then
-            if python3 check_align.py "$SO"; then done=yes; fi
+          if [ -z "$P" ]; then
+            sudo apt-get update -qq >/dev/null 2>&1 && \
+              sudo apt-get install -y -qq patchelf >/dev/null 2>&1 || true
+            command -v patchelf >/dev/null 2>&1 && P=patchelf
           fi
-          if [ "$done" != "yes" ]; then
-            echo "跳过 16KB 改写（4 KB 页机型不受影响）"
-            cp /tmp/metasec.orig.so "$SO"
+          if [ -z "$P" ]; then
+            echo "没有 patchelf，跳过（4 KB 页机型不受影响）"
+          else
+            echo "patchelf: $("$P" --version 2>&1 | head -1)"
+            "$P" --page-size 16384 "$SO" || echo "patchelf 出错"
+            python3 check_align.py "$SO" || cp /tmp/metasec.orig.so "$SO"
           fi
 
       - name: 配置 Gradle
