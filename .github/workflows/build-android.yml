@@ -46,6 +46,29 @@ jobs:
                           "ndk;26.1.10909125" "cmake;3.22.1"
           ls "$SDK/ndk" || true
 
+      # 上游这份 so 是 4 KB 页对齐（align 2**12），Android 15 的 16 KB 页机型会拒绝加载。
+      # patchelf 能不动 vaddr 地把 p_align 抬到 16 KB：vaddr 不变 => 运行时的符号偏移也不变。
+      # 只在 CI 里改，仓库里的原始文件保持原样。
+      - name: 让 so 兼容 16KB 页（Android 15+）
+        run: |
+          SO=app/src/main/jniLibs/arm64-v8a/libmetasec_ml.so
+          cp "$SO" /tmp/metasec.orig.so
+          installed=no
+          command -v patchelf >/dev/null 2>&1 && installed=yes
+          if [ "$installed" != "yes" ]; then
+            if sudo apt-get update -qq >/dev/null 2>&1 && sudo apt-get install -y -qq patchelf >/dev/null 2>&1; then
+              installed=yes
+            fi
+          fi
+          done=no
+          if [ "$installed" = "yes" ] && patchelf --page-size 16384 "$SO" 2>/dev/null; then
+            if python3 check_align.py "$SO"; then done=yes; fi
+          fi
+          if [ "$done" != "yes" ]; then
+            echo "跳过 16KB 改写（4 KB 页机型不受影响）"
+            cp /tmp/metasec.orig.so "$SO"
+          fi
+
       - name: 配置 Gradle
         uses: gradle/actions/setup-gradle@v4
         with:

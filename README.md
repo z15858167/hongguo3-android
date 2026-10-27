@@ -4,6 +4,16 @@
 
 装上就能用：不需要电脑、不需要填地址、不需要额外装 Python / Java / 模拟器。
 
+## 下载安装
+
+GitHub Actions 每次构建成功后会更新同一个预发布：
+
+**https://github.com/z15858167/hongguo3-android/releases/tag/latest**
+
+APK 在「Assets」里（`app-release.apk`），手机下载后允许「未知来源」即可安装。
+
+> 第一次打开要联网（取榜单、取签名所需数据），之后播放过的剧会在本地留明文缓存。
+
 ## 和桌面版（V3）的差别只有一处
 
 | | 桌面版 | 本仓库 |
@@ -26,8 +36,16 @@
 1. `System.loadLibrary("metasec_ml")` —— so 的 `JNI_OnLoad` 会
    `RegisterNatives(ms/bd/c/m, a(IIJLjava/lang/String;Ljava/lang/Object;)Ljava/lang/Object;)`，
    也就是把 native 入口绑到 `ms.bd.c.m.a`；
-2. 真正的签名函数是个**净函数**（入参两个字符串、返回签名串），不在导出表里，
-   所以用 `libmetasec_ml.so` 的加载基址 + 偏移 `0x27d288` 定位（见 `cpp/signer.c`）。
+2. 真正的签名函数是 so 内部的**净函数**，不在导出表里，所以按「加载基址 + 偏移」调用。
+   两个候选，代码里都试探一遍（见 `cpp/signer.c`）：
+
+   | 偏移 | 调用约定 | 来源 |
+   |---|---|---|
+   | `0x168c80`（首选） | `sign(url, header)` 2 参数 | `upstream/.../FqTrace.java` 的 `SIGN`，**已实测出真签名** |
+   | `0x27d288`（兜底） | `sign(url, header, 0x18, tick, 0xffffffffffffff, counter)` 6 参数 | `MetasecSign.java` 的 `SIGN_OFFSET` |
+
+   `0x27d288` 落在本 so 的 `.rodata`（`.text` 只到 `0x268d64`），直接跳过去必崩，
+   所以调用前先查 `/proc/self/maps` 确认目标地址可执行，不可执行就跳过。
 
 配套的三个 Java 类必须保留，否则 so 加载即崩：
 
@@ -36,7 +54,15 @@
 - `com.bytedance.mobsec.metasec.ml.MS` —— so **回调**的 Java 方法（反调试查调用栈），
   **不能**声明成 native
 
-> 偏移 `0x27d288` 只对当前这份 so 有效，换 so 要重新定位。
+> 偏移只对你手上这一份 `libmetasec_ml.so` 有效（md5 变了就要重新定位）。
+> so 通过 `JNI_OnLoad` 注册 native 时会回调 `MS.b(...)` 问环境；App 把证书
+> `assets/ms_16777218.bin`、版本号、`.msdata` 路径都照着桌面版的实测值补齐了。
+
+## 功能（对齐 V3）
+
+首页榜单（推荐 / 热播 / 新剧）、收藏、观看历史（可清空）、搜索（含联想词）、
+分类浏览（短剧 / 漫剧 / AI 剧 + 主题·设定·背景·排序·受众·时间·状态筛选，滚动翻页）、
+播放页（选集、清晰度、0.75~2x 倍速、自动连播、上一集/下一集、下一集预热、进度续播）。
 
 ### 2. 取流
 
@@ -77,9 +103,18 @@ app/src/main/java/com/hongguo/client/
 gradle assembleRelease   # 产物 app/build/outputs/apk/release/app-release.apk
 ```
 
-不装环境也行：推一个 commit，GitHub Actions 会编译并把 APK 传到 artifact（`build-android`）。
+不装环境也行：推一个 commit，GitHub Actions 会编译 + 发布到 `latest` 预发布（`build-android`）。
+历史构建产物在 Actions 的 Artifacts 里保留 30 天。
 
 release 用的是 AGP 自带 debug 签名，可直接 `adb install`。
+
+> 本机 `github.com` 不通（只有 `api.github.com` 通）时，`git push` 会失败，
+> 可以用仓库里的 `tools/ghpush.py`：它走 GitHub Git Data REST API 手动
+> `blob → tree → commit → ref`，效果和 push 一样。
+>
+> ```bash
+> python3 tools/ghpush.py "提交说明"
+> ```
 
 ## 已知限制
 
