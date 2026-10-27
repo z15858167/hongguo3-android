@@ -19,6 +19,8 @@ jobs:
   apk:
     runs-on: ubuntu-latest
     timeout-minutes: 40
+    permissions:
+      contents: write
 
     steps:
       - uses: actions/checkout@v4
@@ -67,3 +69,20 @@ jobs:
           name: hongguo-android
           path: app/build/outputs/apk/release/*.apk
           retention-days: 30
+
+      # 滚动发布到同一个 tag：main 上每次有改动都更新这里，手机直接下这个链接就行
+      - name: 发布到 latest 预发布
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: latest
+          name: 最新构建（自动）
+          body: |
+            每次 main 有新提交都会更新这里。
+
+            · 只支持 arm64-v8a（64 位安卓）
+            · 首次打开需要联网，签名在本地完成，不连任何第三方服务器
+            · 装不上先看 README 的「常见问题」
+          prerelease: true
+          files: app/build/outputs/apk/release/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
