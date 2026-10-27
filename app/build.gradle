@@ -32,6 +32,9 @@ android {
 
     buildTypes {
         release {
+            // 千万别开 minify：ms.bd.c.m / ms.bd.c.a4$a / ...metasec.ml.MS 这三个类
+            // 没有任何 Java 代码引用它们（只有 so 通过 FindClass / RegisterNatives 找），
+            // 一旦被 R8 移除或改名，加载 so 就会崩。
             minifyEnabled false
             shrinkResources false
             // CI 上没有自定义 keystore，用 AGP 自带的 debug 签名（可直接安装）
