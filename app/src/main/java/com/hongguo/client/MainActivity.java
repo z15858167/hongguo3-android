@@ -57,11 +57,11 @@ public class MainActivity extends AppCompatActivity {
         select(0);
     }
 
-    /** 启动时后台做一次缓存淘汰（上限见 Cache.limit，默认 512MB）。 */
+    /** 启动时后台做一次缓存淘汰（水位见 Cache：1GB 上限，达到 824MB 清一半）。 */
     private void trimCacheAsync() {
         new Thread(() -> {
             try {
-                long freed = Cache.trim(getCacheDir(), Cache.limit(getCacheDir()));
+                long freed = Cache.trim(getCacheDir());
                 if (freed > 0) {
                     Stats.note("启动时自动清理缓存 " + Cache.fmt(freed));
                 }
@@ -105,8 +105,6 @@ public class MainActivity extends AppCompatActivity {
         top.addView(title, new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
-        top.addView(action("搜索", v -> startActivity(
-                new android.content.Intent(this, SearchActivity.class))));
         top.addView(action("分类", v -> startActivity(
                 new android.content.Intent(this, BrowseActivity.class))));
         clearBtn = action("清空", v -> clearCurrent());
@@ -115,6 +113,39 @@ public class MainActivity extends AppCompatActivity {
         top.addView(action("缓存", v -> showCache()));
         top.addView(action("诊断", v -> showDiag()));
         root.addView(top);
+
+        // ---- 搜索框：标题下方一条横向输入样式（点击进搜索页）----
+        LinearLayout searchBox = new LinearLayout(this);
+        searchBox.setOrientation(LinearLayout.HORIZONTAL);
+        searchBox.setGravity(Gravity.CENTER_VERTICAL);
+        GradientDrawable sbBg = new GradientDrawable();
+        sbBg.setCornerRadius(dp(20));
+        sbBg.setColor(0x14FFFFFF);
+        searchBox.setBackground(sbBg);
+        searchBox.setPadding(dp(14), dp(9), dp(14), dp(9));
+        searchBox.setOnClickListener(v -> startActivity(
+                new android.content.Intent(this, SearchActivity.class)));
+
+        TextView sbIcon = new TextView(this);
+        sbIcon.setText("\ud83d\udd0d");
+        sbIcon.setTextSize(13);
+        searchBox.addView(sbIcon);
+
+        TextView sbHint = new TextView(this);
+        sbHint.setText("搜索短剧名称");
+        sbHint.setTextSize(14);
+        sbHint.setTextColor(0xFF8A8A8E);
+        sbHint.setPadding(dp(6), 0, 0, 0);
+        searchBox.addView(sbHint, new LinearLayout.LayoutParams(0,
+                ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
+
+        LinearLayout.LayoutParams sbLp = new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        sbLp.leftMargin = dp(16);
+        sbLp.rightMargin = dp(16);
+        sbLp.topMargin = dp(2);
+        sbLp.bottomMargin = dp(8);
+        root.addView(searchBox, sbLp);
 
         HorizontalScrollView hs = new HorizontalScrollView(this);
         hs.setHorizontalScrollBarEnabled(false);
@@ -306,10 +337,12 @@ public class MainActivity extends AppCompatActivity {
         for (java.io.File f : Cache.top(dir, 5)) {
             detail.append(f.getName()).append("  ").append(Cache.fmt(f.length())).append('\n');
         }
-        String msg = "当前缓存 " + Cache.fmt(total) + "（上限 " + Cache.fmt(Cache.limit(dir)) + "）\n"
-                + "文件数 " + Cache.list(dir).size() + "\n\n"
+        String msg = Cache.line(dir) + "\n"
+                + "文件数 " + Cache.list(dir).size()
+                + "，设备剩余 " + Cache.fmt(dir.getUsableSpace()) + "\n\n"
                 + (detail.length() > 0 ? "最大的几个：\n" + detail : "（暂无缓存）\n")
-                + "\n播放产生的临时文件会在离开播放页和超过上限时自动清理。";
+                + "\n缓存区上限 1GB；占用到 824MB（即空闲不足 200MB）时自动清掉一半，"
+                + "\n设备剩余不足 150MB 时会继续清。没看完的集离开播放页即删。";
         new AlertDialog.Builder(this)
                 .setTitle("缓存")
                 .setMessage(msg)

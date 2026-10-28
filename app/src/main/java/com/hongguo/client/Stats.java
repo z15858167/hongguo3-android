@@ -96,9 +96,11 @@ public final class Stats {
 
         java.io.File dir = ctx.getCacheDir();
         long total = Cache.size(dir);
-        long cap = Cache.limit(dir);
+        long cap = Cache.limit(dir);   // 有效上限（设备空间不足时会低于 1GB）
+        sb.append("  触发线 ").append(Cache.fmt(Math.max(0, cap - Cache.KEEP_FREE)))
+                .append("（空闲低于 ").append(Cache.fmt(Cache.KEEP_FREE)).append(" 即清理）\n");
         sb.append("缓存（内部 cache 目录）\n");
-        sb.append("  占用 ").append(Cache.fmt(total)).append("，上限 ").append(Cache.fmt(cap)).append('\n');
+        sb.append("  ").append(Cache.line(dir)).append('\n');
         sb.append("  文件数 ").append(Cache.list(dir).size()).append('\n');
         for (java.io.File f : Cache.top(dir, 3)) {
             sb.append("  最大：").append(f.getName()).append(" ").append(Cache.fmt(f.length())).append('\n');

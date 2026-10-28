@@ -2,6 +2,8 @@ package com.hongguo.client.cenc;
 
 import android.util.Log;
 
+import com.hongguo.client.Cache;
+
 import androidx.media3.common.C;
 import androidx.media3.datasource.DataSource;
 import androidx.media3.datasource.DataSpec;
@@ -167,6 +169,8 @@ public final class StreamSource implements DataSource {
 
         // 3) 头部写入缓存（等长替换，密文偏移 = 明文偏移，直接落盘即可）
         if (!cache.exists() || cache.length() < total) {
+            // 整集预分配前先腾地方：按这一集的真实大小预留，触发就清掉一半
+            Cache.ensure(cache.getParentFile(), total);
             try (RandomAccessFile out = new RandomAccessFile(cache, "rw")) {
                 out.setLength(total);
                 out.seek(0);
