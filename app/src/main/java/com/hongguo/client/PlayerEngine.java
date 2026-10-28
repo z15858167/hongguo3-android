@@ -27,8 +27,10 @@ import java.io.File;
  * 所以 playWhenReady=false 的预载只占网络/buffer，不占硬解实例，
  * 避免"低端机第二路 MediaCodec 起不来"（计划里的 R1）。
  *
- * 带宽控制：预载槽的 StreamSource 带 softLimit（默认 6MB），下到量就自己停住，
- * activate 时置 -1 满速。所以任何时刻只有一条连接在满速跑。
+ * 带宽控制：预载槽用 StreamSource 的"读窗"模式（setAhead），后台只下到
+ * 「ExoPlayer 已读到的位置 + 16MB」就停，activate 时 setUnlimited 满速。
+ * v0.6.0~0.7.0 用的是固定 8MB 闸门，结果 loader 读满 8MB 后永久阻塞、
+ * 预载槽永远进不了 READY —— 这是"双播放器形同虚设"的根因。
  */
 final class PlayerEngine {
 
@@ -59,8 +61,11 @@ final class PlayerEngine {
         }
     }
 
-    /** 预载只下这么多就停：够十几秒缓冲，又不至于跟正在播的那一集抢带宽。 */
-    private static final long PRELOAD_BYTES = 8L * 1024 * 1024;
+    /**
+     * 预载读窗：后台最多下到「前台已读位置 + 这个字节数」。
+     * 16MB ≈ 4K/1080P 十几秒，足够切过去立刻出画，又不会把整集下完占带宽。
+     */
+    private static final long PRELOAD_AHEAD = 16L * 1024 * 1024;
 
     private final Context ctx;
     private final Listener listener;
@@ -69,9 +74,42 @@ final class PlayerEngine {
     /** 当前"在台上"的槽：load 完成时靠它决定要不要直接开播（应对超时换台的场景）。 */
     private int activeId = 0;
 
+    /** 低内存设备：关掉预载、缩小缓冲，宁可慢一点也别被系统回收。 */
+    private final boolean lowRam;
+    private final boolean preloadOn;
+    private final int targetBufferBytes;
+    private final long preloadAhead;
+
     PlayerEngine(Context ctx, Listener l) {
         this.ctx = ctx;
         this.listener = l;
+        this.lowRam = detectLowRam(ctx);
+        this.preloadOn = !lowRam;
+        this.targetBufferBytes = (lowRam ? 12 : 24) * 1024 * 1024;
+        this.preloadAhead = lowRam ? 6L * 1024 * 1024 : PRELOAD_AHEAD;
+    }
+
+    static boolean detectLowRam(Context ctx) {
+        boolean low = false;
+        try {
+            android.app.ActivityManager am =
+                    (android.app.ActivityManager) ctx.getSystemService(Context.ACTIVITY_SERVICE);
+            if (am != null) {
+                low = am.isLowRamDevice() || am.getMemoryClass() < 192;
+            }
+        } catch (Throwable ignored) {
+        }
+        if (Runtime.getRuntime().maxMemory() / (1024 * 1024) < 192) low = true;
+        return low;
+    }
+
+    /** 预载是否可用（低内存机直接关掉，退回"点一下才加载"）。 */
+    boolean preloadEnabled() {
+        return preloadOn;
+    }
+
+    boolean isLowRam() {
+        return lowRam;
     }
 
     void attach(FrameLayout stage) {
@@ -128,7 +166,7 @@ final class PlayerEngine {
                     (done, total, doneAll) -> {
                         if (listener != null) listener.onSlotBuffer(id, done, total, doneAll);
                     });
-            if (preload) src.setSoftLimit(PRELOAD_BYTES);
+            if (preload && preloadOn) src.setAhead(preloadAhead);
             s.stream = src;
             Cache.pin(file);
             ProgressiveMediaSource ms = new ProgressiveMediaSource.Factory(() -> src)
@@ -148,7 +186,7 @@ final class PlayerEngine {
     void activate(int id, float speed) {
         Slot s = slots[id];
         activeId = id;
-        if (s.stream != null) s.stream.setSoftLimit(-1);
+        if (s.stream != null) s.stream.setUnlimited();
         s.view.setVisibility(android.view.View.VISIBLE);
         if (s.player != null) {
             s.player.setPlaybackSpeed(speed);
@@ -160,9 +198,7 @@ final class PlayerEngine {
     /** 只让带宽，不停播：换集时旧的那一条继续正常播，只是不再猛拉数据。 */
     void throttle(int id) {
         Slot s = slots[id];
-        if (s.stream != null) {
-            s.stream.setSoftLimit(s.stream.downloaded() + 4L * 1024 * 1024);
-        }
+        if (s.stream != null) s.stream.setStopAhead();
     }
 
     /** 让出带宽：停住并只保留 4MB 缓冲。 */
@@ -172,9 +208,7 @@ final class PlayerEngine {
             s.player.setPlayWhenReady(false);
             s.player.pause();
         }
-        if (s.stream != null) {
-            s.stream.setSoftLimit(s.stream.downloaded() + 4L * 1024 * 1024);
-        }
+        if (s.stream != null) s.stream.setStopAhead();
     }
 
     /** 停播并丢掉这条的流（文件保留在缓存，由 Cache 的 LRU 决定去留）。 */
@@ -224,9 +258,10 @@ final class PlayerEngine {
     private ExoPlayer buildPlayer(final int id) {
         DefaultLoadControl lc = new DefaultLoadControl.Builder()
                 // 起播只要 400ms 缓冲（默认 2500ms 就是"点开干等"的元凶）
-                .setBufferDurationsMs(3_000, 12_000, 400, 1_000)
-                .setBackBuffer(3_000, false)
-                .setTargetBufferBytes(32 * 1024 * 1024)
+                // maxBuffer 12s→20s：预载槽能多备几秒，切过去不会立刻耗尽
+                .setBufferDurationsMs(3_000, lowRam ? 12_000 : 20_000, 400, 1_000)
+                .setBackBuffer(2_000, false)
+                .setTargetBufferBytes(targetBufferBytes)
                 .build();
         ExoPlayer p = new ExoPlayer.Builder(ctx)
                 .setLoadControl(lc)

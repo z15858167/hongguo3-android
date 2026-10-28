@@ -147,9 +147,21 @@ public final class Cache {
         for (File f : list(dir)) {
             if (isPinned(f.getName())) continue;
             long n = f.length();
-            if (f.delete()) freed += n;
+            if (f.delete()) {
+                freed += n;
+                dropDoneMark(f);
+            }
         }
         return freed;
+    }
+
+    /** 删掉 <file>.done 完成标记（只对 .enc/.mp4 生效）。 */
+    private static void dropDoneMark(File f) {
+        if (f == null) return;
+        String name = f.getName();
+        if (!(name.endsWith(".enc") || name.endsWith(".mp4"))) return;
+        File m = new File(f.getAbsolutePath() + ".done");
+        if (m.exists()) m.delete();
     }
 
     /** 命中缓存时刷新修改时间，让 LRU 知道这集刚用过。 */
@@ -212,6 +224,7 @@ public final class Cache {
             if (f.delete()) {
                 freed += sz;
                 total -= sz;
+                dropDoneMark(f);        // 连带删掉完成标记，避免留下"有 .done 却没文件"的孤儿
             }
         }
         return freed;

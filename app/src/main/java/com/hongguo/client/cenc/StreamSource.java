@@ -39,11 +39,22 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *   - waitFor() 从 15ms 轮询改成条件变量 wait/notifyAll；
  *   - 新增 softLimit：预载的那一集只下到 N MB 就停，把带宽让给正在播的一集，
  *     激活时 setSoftLimit(-1) 立刻满速。
+ *
+ * v0.8.0 的关键改动（这三个是"切集卡好几秒"的真因）：
+ *   - softLimit 从"绝对字节数"改成**读窗**：`softLimit = frontier + aheadBytes`，
+ *     前台读到哪，后台就跟着下到"读前沿 + 16MB"。原来卡死在固定 8MB，
+ *     前台读完 8MB 后再读就会无限期阻塞（waitFor 把超时计时重置了），
+ *     ExoPlayer 永远进不了 READY，预载等于没做；
+ *   - waitFor() 不再重置超时，也不会把"超时"当成 EOF 返回（改成抛 IOException），
+ *     否则 ExoPlayer 会把没下完的片当成播完；
+ *   - prepare() 支持**续传**：已经下好的半截文件不再删掉重下（原来等于把预载白做）。
  */
 public final class StreamSource implements DataSource {
 
     private static final String TAG = "StreamSource";
     private static final int HEAD = 256 * 1024;
+    /** 少于这么多字节说明头都不完整，无法续传。 */
+    private static final int HEAD_MIN = 256 * 1024;
     private static final int WAIT_TIMEOUT_MS = 30_000;
     /** 进度回调节流：至少 1MB 或 300ms 才回调一次（原来每 64KB 一次，UI 线程被打满）。 */
     private static final long PROG_BYTES = 1024 * 1024;
@@ -73,8 +84,14 @@ public final class StreamSource implements DataSource {
     private final AtomicBoolean stop = new AtomicBoolean();
     private Thread worker;
     private volatile HttpURLConnection conn;
-    /** 预载限速：下到这么多字节就暂停（-1 = 不限速）。 */
+    /** 下载闸门：后台最多下到这个绝对字节位置（-1 = 不限速）。 */
     private volatile long softLimit = -1;
+    /** 读窗模式：true 时 softLimit 随前台读前沿自动前移。 */
+    private volatile boolean aheadMode;
+    /** 读窗大小：读前沿 + 这个字节数。 */
+    private volatile long aheadBytes = 16L * 1024 * 1024;
+    /** 前台（ExoPlayer 的 loader）已经读到的最远位置。 */
+    private volatile long frontier;
     /** 服务器不支持 Range（返回 200）时必须整段顺序下载。 */
     private boolean noRange;
 
@@ -97,10 +114,45 @@ public final class StreamSource implements DataSource {
         return cache;
     }
 
-    /** 限速：绝对字节偏移，-1 = 不限速；预载用 6MB，activate 时置 -1。 */
+    /** 旧接口：直接给绝对字节闸门（-1 = 不限速）。新代码请用下面三个语义化方法。 */
     public void setSoftLimit(long bytes) {
-        softLimit = bytes;
+        aheadMode = false;
         synchronized (lock) {
+            softLimit = bytes;
+            lock.notifyAll();
+        }
+    }
+
+    /**
+     * 预载：开启"读窗"模式——前台读到 frontier，后台就跟着下到 frontier + bytes。
+     *
+     * 关键点在"跟着走"，而不是卡在某个固定字节：ExoPlayer 缓冲到 maxBuffer 就停止 read，
+     * 此时 frontier 不再前进，后台自然停在 frontier+16MB；而 loader 需要的任何位置
+     * 都落在窗内，所以 waitFor 不会因为限速而阻塞，预载槽能正常进 READY。
+     */
+    public void setAhead(long bytes) {
+        aheadBytes = Math.max(0, bytes);
+        aheadMode = bytes >= 0;
+        synchronized (lock) {
+            softLimit = aheadMode ? frontier + aheadBytes : -1;
+            lock.notifyAll();
+        }
+    }
+
+    /** 上台播放：解除限速，满速下载。 */
+    public void setUnlimited() {
+        aheadMode = false;
+        synchronized (lock) {
+            softLimit = -1;
+            lock.notifyAll();
+        }
+    }
+
+    /** 让出带宽：停在当前下载点 + 4MB（已经在缓冲里的部分别浪费）。 */
+    public void setStopAhead() {
+        aheadMode = false;
+        synchronized (lock) {
+            softLimit = downloaded + 4L * 1024 * 1024;
             lock.notifyAll();
         }
     }
@@ -129,10 +181,11 @@ public final class StreamSource implements DataSource {
         if (length == 0) return 0;
         if (total >= 0 && pos >= total) return C.RESULT_END_OF_INPUT;
 
-        // 等到至少 1 字节可用（下载结束仍不够就是 EOF）
+        // 等到至少 1 字节可用（下载结束仍不够才是 EOF，超时不能当 EOF）
         if (!waitFor(pos + 1)) {
-            if (failed && downloaded <= pos) throw new IOException("下载中断");
-            return C.RESULT_END_OF_INPUT;
+            if (failed) throw new IOException("下载中断");
+            if (isFinished() || (total >= 0 && pos >= total)) return C.RESULT_END_OF_INPUT;
+            throw new IOException("读超时（已下 " + downloaded + " / " + total + "）");
         }
         long ready = downloaded;
         int n = (int) Math.min(length, ready - pos);
@@ -151,6 +204,14 @@ public final class StreamSource implements DataSource {
         }
 
         pos += n;
+        frontier = pos;
+        if (aheadMode) {
+            // 读窗跟着前台走：前台读多少，后台就跟到"这里 + 16MB"
+            synchronized (lock) {
+                softLimit = frontier + aheadBytes;
+                lock.notifyAll();
+            }
+        }
         return n;
     }
 
@@ -228,13 +289,22 @@ public final class StreamSource implements DataSource {
             downloaded = have;
             finished = true;
             if (prog != null) prog.on(have, total, true);
+        } else if (canResume(have, total, done, head)) {
+            // 上次下到一半（比如预载到 16MB 就被切走）：能对得上就接着下，别作废
+            Cache.ensure(cache.getParentFile(), 8L * 1024 * 1024);
+            downloaded = have;
+            lastProgBytes = have;
+            lastProgMs = System.currentTimeMillis();
+            Log.i(TAG, "续传：已有 " + have + " / " + total + " 字节");
+            startWorker(have);
         } else {
-            // 没有 .done 标记 = 上次没下完。旧版本的预分配文件长度可能等于整集，
-            // 无法区分"真下完"与"只写了头"，一律删掉重下（每集只会发生一次）。
+            // 头不完整 / 不是同一条流 / 旧版预分配遗留 → 只能重下
             if (have > 0) {
                 cache.delete();
             }
-            have = 0;
+            if (done) {
+                doneMark.delete();          // 孤儿 .done：标记还在但文件没了
+            }
             // 只按一段的量预留空间，绝不按整集预分配（预分配正是"假完整"的来源）
             Cache.ensure(cache.getParentFile(), Math.min(total, 32L * 1024 * 1024));
             try (RandomAccessFile out = new RandomAccessFile(cache, "rw")) {
@@ -244,11 +314,41 @@ public final class StreamSource implements DataSource {
             downloaded = Math.min(head.length, (int) total);
             lastProgBytes = downloaded;
             lastProgMs = System.currentTimeMillis();
-            startWorker(noRange ? 0 : downloaded);
+            if (downloaded >= total) {
+                finishDownload();
+            } else {
+                startWorker(noRange ? 0 : downloaded);
+            }
         }
         Log.i(TAG, "prepare ok: total=" + total + " cached=" + downloaded
                 + " noRange=" + noRange + " tracks=" + info.tracks.size()
                 + " patches=" + info.patches.size());
+    }
+
+    /**
+     * 能否续传：文件里已经有完整头、长度小于总长、没有 .done 标记、服务器支持 Range，
+     * 且缓存前 4KB 与刚取到的头一致（换 CDN / 换了清晰度后偏移会变，必须比对）。
+     */
+    private boolean canResume(long have, long total, boolean done, byte[] head) {
+        if (done || noRange) return false;
+        if (have < HEAD_MIN || have >= total) return false;
+        return headMatches(head, 4096);
+    }
+
+    private boolean headMatches(byte[] head, int n) {
+        int len = Math.min(n, head.length);
+        if (len <= 0 || cache.length() < len) return false;
+        byte[] got = new byte[len];
+        try (RandomAccessFile f = new RandomAccessFile(cache, "r")) {
+            f.seek(0);
+            f.readFully(got);
+        } catch (IOException e) {
+            return false;
+        }
+        for (int i = 0; i < len; i++) {
+            if (got[i] != head[i]) return false;
+        }
+        return true;
     }
 
     private byte[] fetchRange(long start, long end) throws IOException {
@@ -380,15 +480,16 @@ public final class StreamSource implements DataSource {
     private boolean waitFor(long need) {
         long t0 = System.currentTimeMillis();
         synchronized (lock) {
+            // seek 保护：前台要读的位置已经越过读窗（拖进度条 / 跳到没下过的地方），
+            // 把窗一次性往前推到 need + aheadBytes，否则 loader 会一直等一个永远不来的字节
+            if (aheadMode && softLimit >= 0 && need >= softLimit) {
+                softLimit = need + aheadBytes;
+                lock.notifyAll();
+            }
             while (downloaded < need) {
                 if (isFinished() || failed || stop.get()) return downloaded >= need;
-                if (softLimit >= 0 && downloaded >= softLimit) {
-                    // 卡在预载限速上不属于"网络卡住"：无限等，别当成流结束，
-                    // 否则 ExoPlayer 会把没下完的片当成 EOF。activate 时会解锁。
-                    t0 = System.currentTimeMillis();
-                }
                 long left = WAIT_TIMEOUT_MS - (System.currentTimeMillis() - t0);
-                if (left <= 0) return downloaded >= need;
+                if (left <= 0) return false;      // 超时单独处理：调用方会抛 IOException，不能当 EOF
                 try {
                     lock.wait(Math.min(left, 200));
                 } catch (InterruptedException e) {

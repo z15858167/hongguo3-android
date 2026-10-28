@@ -61,8 +61,20 @@ APK 在「Assets」里（`app-release.apk`），手机下载后允许「未知�
 ## 功能（对齐 V3）
 
 首页榜单（推荐 / 热播 / 新剧）、收藏、观看历史（可清空）、搜索（含联想词）、
-分类浏览（短剧 / 漫剧 / AI 剧 + 主题·设定·背景·排序·受众·时间·状态筛选，滚动翻页）、
-播放页（选集、清晰度、0.75~2x 倍速、自动连播、上一集/下一集、下一集预热、进度续播）。
+分类浏览（短剧 / 漫剧 / AI 剧 + 主题·设定·背景·排序·受众·时间·状态筛选，滚动翻页）。
+
+播放页（v0.8.0，对齐红果原生）：
+
+| 项 | 行为 |
+|---|---|
+| 启动 | 直接进 feed 并播推荐第一部第 1 集；播完自动进第 2 集 |
+| feed | 视频铺满整屏，左下「剧名 / 标签 / 第N集｜简介 / 观看完整短剧·全N集」，右侧追剧，底部**只有进度条 + 首页｜剧场**（没有全屏按钮）；上下滑 = 切整部剧 |
+| 进详情 | 点「观看完整短剧」**0ms 硬切**：视频位置与尺寸**完全不变**，只去掉左下文字，底部出现一行 `选集 N集 ｜ 1.0x ｜ 1080P ｜ ⛶`（进度条贴屏幕最底、按钮行在它上方） |
+| 选集 | 白底面板**上推 260ms**（55% 屏高、无封面无简介 tab、1-30 分页、6 列、当前集浅橙+播放中）；点某一集 → 立即切集 + 面板回落 200ms |
+| 倍速 | 档位 `0.75/1.0/1.25/1.5/2.0`（上限 2.0）；**长按恒 2.0x，松手回手动设定档** |
+| 清晰度 | 贴按钮朝上弹出的选择窗；切档**保留当前进度**重新取流 |
+| 手势 | 单击=暂停/播放、长按=2x、上下滑=切剧(feed)/切集(详情与全屏)、左右滑=快进快退、双击已取消 |
+| 秒切 | `PlayerEngine` 双 ExoPlayer 槽位，空闲槽预载下一条（读窗 = 读前沿 + 16MB），切换只做 surface 对开 + activate |
 
 ### 2. 取流
 
@@ -90,9 +102,13 @@ app/src/main/java/ms/bd/c/           so 要求的宿主类
 app/src/main/java/com/hongguo/client/
     Signer.java                      签名封装 + 诊断
     Api.java                         榜单 / 剧集 / 直链 / 下载
-    cenc/                            Boxes Moov Ctr Spade Decryptor
-    MainActivity.java                首页（榜单 / 收藏 / 历史）
-    PlayActivity.java                播放（选集 / 清晰度 / 续播）
+    cenc/                            Boxes Moov Ctr Spade Decryptor StreamSource
+    FeedQueue.java                   feed 节目单（榜单摊平 + 跨剧展开）
+    PlayerEngine.java                双 ExoPlayer 槽位（预载 / 秒切）
+    EpisodeSheet.java                白底分页选集面板
+    Cache.java / Stats.java          1GB 缓存水位 / 自检打点
+    MainActivity.java                剧场（榜单 / 收藏 / 历史）
+    PlayActivity.java                播放（feed + 详情 + 全屏）
 ```
 
 ## 构建
