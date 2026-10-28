@@ -66,6 +66,8 @@ final class PlayerEngine {
     private final Listener listener;
     private final Slot[] slots = new Slot[]{new Slot(0), new Slot(1)};
     private FrameLayout host;
+    /** 当前"在台上"的槽：load 完成时靠它决定要不要直接开播（应对超时换台的场景）。 */
+    private int activeId = 0;
 
     PlayerEngine(Context ctx, Listener l) {
         this.ctx = ctx;
@@ -130,7 +132,9 @@ final class PlayerEngine {
         }
         p.prepare();
         if (startSec > 0) p.seekTo(startSec * 1000L);
-        p.setPlayWhenReady(false);
+        // 只有"在台上"的槽才自动开播；预载槽静音待命。
+        // 超时换台的场景下 activate() 早已把 activeId 指过来，这里自然接上。
+        p.setPlayWhenReady(!preload && id == activeId);
         // 可见性交给调用方：真正的"上台"由 activate() 打开，
         // 否则待切换的那一槽会提前盖住正在播的画面。
     }
@@ -138,6 +142,7 @@ final class PlayerEngine {
     /** 开始出声播放（顺带解除预载限速）。 */
     void activate(int id, float speed) {
         Slot s = slots[id];
+        activeId = id;
         if (s.stream != null) s.stream.setSoftLimit(-1);
         s.view.setVisibility(android.view.View.VISIBLE);
         if (s.player != null) {

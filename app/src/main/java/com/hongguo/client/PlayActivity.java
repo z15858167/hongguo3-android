@@ -191,7 +191,7 @@ public class PlayActivity extends AppCompatActivity {
         stage.addView(oCenterPlay, cpLp);
 
         // 全屏胶囊（竖屏，压在视频底部）
-        oFsBtn = tv("\u26f6 全屏观看", 12, Color.WHITE);
+        oFsBtn = tv("\u5168\u5c4f\u89c2\u770b", 12, Color.WHITE);
         oFsBtn.setGravity(Gravity.CENTER);
         oFsBtn.setPadding(dp(14), dp(7), dp(14), dp(7));
         GradientDrawable fsg = new GradientDrawable();
@@ -1071,6 +1071,7 @@ public class PlayActivity extends AppCompatActivity {
     private boolean onGesture(MotionEvent ev) {
         switch (ev.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
+                if (switching) return true;   // 正在换集，别叠加手势
                 gDownX = ev.getX();
                 gDownY = ev.getY();
                 gDy = 0;
