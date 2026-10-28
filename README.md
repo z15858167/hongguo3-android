@@ -6,9 +6,12 @@
 
 ## 下载安装
 
-GitHub Actions 每次构建成功后会更新同一个预发布：
+**最新版（滚动更新的指针，地址固定）**：
+https://github.com/z15858167/hongguo3-android/releases/tag/latest
 
-**https://github.com/z15858167/hongguo3-android/releases/tag/latest**
+**历史版本**：https://github.com/z15858167/hongguo3-android/releases
+每个版本一个独立 release（`v0.10.0`、`v0.9.0`…），旧的不会被覆盖；`dev` 分支的
+自测包是 `vX.Y.Z-dev.<构建号>`，标为 Pre-release。
 
 APK 在「Assets」里（`app-release.apk`），手机下载后允许「未知来源」即可安装。
 
@@ -119,8 +122,34 @@ app/src/main/java/com/hongguo/client/
 gradle assembleRelease   # 产物 app/build/outputs/apk/release/app-release.apk
 ```
 
-不装环境也行：推一个 commit，GitHub Actions 会编译 + 发布到 `latest` 预发布（`build-android`）。
-历史构建产物在 Actions 的 Artifacts 里保留 30 天。
+## 分支与发布
+
+| 分支 | 用途 | 推送后 CI 做什么 |
+|---|---|---|
+| `dev` | 日常开发，所有改动先到这里 | 编译 + 发预发布 `vX.Y.Z-dev.<run>`（保留） |
+| `main` | 只接受 `dev` 的 PR 合并 | 编译 + 发正式版 `vX.Y.Z`（保留）+ 滚动更新 `latest` |
+| PR（`dev → main`） | 合并前校验 | 只编译，不发版 |
+
+改代码的流程：
+
+```bash
+# 1. 提交到 dev（自动开/更新 dev -> main 的 PR，不自动合并）
+python3 tools/ghpush.py "改了什么"
+
+# 2. 真机验证没问题后，合并 PR
+python3 tools/ghpush.py --merge
+
+# 3. 看状态：分支差异、PR、最近构建、最近发布
+python3 tools/ghpush.py --status
+```
+
+`versionName` 是版本号来源：发正式版前记得在 `app/build.gradle` 里把
+`versionCode` 和 `versionName` 一起加上去，否则同名版本会退化成 `vX.Y.Z-b<run>`。
+
+> 千万别直接往 `main` 推（`--main` 只留给紧急修复），`main` 上的每一次提交都会
+> 直接变成一个对外发布的正式版本。
+
+不装环境也行：推一个 commit，GitHub Actions 会编译并发布。
 
 release 用仓库里的固定 key（`keystore/hongguo.jks`）签名，可直接 `adb install` 覆盖升级。
 
@@ -145,7 +174,10 @@ release 用仓库里的固定 key（`keystore/hongguo.jks`）签名，可直接 
 > `blob → tree → commit → ref`，效果和 push 一样。
 >
 > ```bash
-> python3 tools/ghpush.py "提交说明"
+> python3 tools/ghpush.py "提交说明"           # 推 dev + 开/更新 PR
+> python3 tools/ghpush.py "提交说明" --wait    # 顺手等 CI 跑完并打印结果
+> python3 tools/ghpush.py --merge             # 合并 dev -> main，随后 CI 发正式版
+> python3 tools/ghpush.py --status            # 分支差异 / PR / 最近构建 / 最近发布
 > ```
 
 ## 已知限制

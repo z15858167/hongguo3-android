@@ -1,15 +1,22 @@
 name: build-android
 
+# 分支策略：
+#   dev  —— 日常开发分支，推上来就构建，产物发成「预发布」，每次一个新 tag，互不覆盖
+#   main —— 只接受从 dev 来的 PR 合并；合并后发正式版本（tag vX.Y.Z），历史全部保留
+#   PR   —— 只构建校验，不发版
 on:
   push:
-    branches: [ main ]
+    branches: [ main, dev ]
     paths:
       - 'app/**'
       - 'tools/**'
       - 'build.gradle'
       - 'settings.gradle'
       - 'gradle.properties'
+      - 'keystore/**'
       - '.github/workflows/build-android.yml'
+  pull_request:
+    branches: [ main ]
   workflow_dispatch:
 
 concurrency:
@@ -53,6 +60,16 @@ jobs:
       - name: 静态体检（preflight）
         run: python3 tools/preflight.py
 
+      - name: 读取版本号
+        id: ver
+        run: |
+          NAME=$(sed -n 's/.*versionName[[:space:]]*"\([^"]*\)".*/\1/p' app/build.gradle | head -1)
+          CODE=$(sed -n 's/.*versionCode[[:space:]]*\([0-9][0-9]*\).*/\1/p' app/build.gradle | head -1)
+          test -n "$NAME" || { echo "读不到 versionName"; exit 1; }
+          echo "name=$NAME" >> "$GITHUB_OUTPUT"
+          echo "code=$CODE" >> "$GITHUB_OUTPUT"
+          echo "版本：$NAME (versionCode $CODE)"
+
       - name: 配置 Gradle
         uses: gradle/actions/setup-gradle@v4
         with:
@@ -70,26 +87,77 @@ jobs:
           echo "--- 大小 ---"
           du -h "$APK"
 
-      - name: 上传
+      - name: 上传构建产物
         uses: actions/upload-artifact@v4
         with:
-          name: hongguo-android
+          name: hongguo-${{ steps.ver.outputs.name }}-${{ github.run_number }}
           path: app/build/outputs/apk/release/*.apk
-          retention-days: 30
+          retention-days: 90
 
-      # 滚动发布到同一个 tag：main 上每次有改动都更新这里，手机直接下这个链接就行
-      - name: 发布到 latest 预发布
+      # ---------- dev：每次推送留一个预发布，tag 带 build 号，永不覆盖 ----------
+      - name: 发布开发版（dev）
+        if: github.event_name == 'push' && github.ref == 'refs/heads/dev'
+        uses: softprops/action-gh-release@v2
+        with:
+          tag_name: v${{ steps.ver.outputs.name }}-dev.${{ github.run_number }}
+          name: v${{ steps.ver.outputs.name }} 开发版 #${{ github.run_number }}
+          prerelease: true
+          body: |
+            dev 分支自动构建，用于真机验证。
+
+            分支：dev
+            提交：${{ github.sha }}
+            versionCode：${{ steps.ver.outputs.code }}
+
+            · 只支持 arm64-v8a（64 位安卓）
+            · 装不上先看 README 的「常见问题」
+          files: app/build/outputs/apk/release/*.apk
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+
+      # ---------- main：一个版本一个 release，历史全部保留 ----------
+      - name: 发布正式版（main）
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
+        env:
+          GH_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          set -e
+          V="${{ steps.ver.outputs.name }}"
+          TAG="v$V"
+          # 同名版本已存在（改了代码却没升 versionName）时追加 build 号，绝不覆盖旧版本
+          if gh release view "$TAG" --repo "$GITHUB_REPOSITORY" >/dev/null 2>&1; then
+            TAG="v$V-b${{ github.run_number }}"
+          fi
+          echo "发布 tag = $TAG"
+
+          cat > /tmp/notes.md <<EOF
+          main 分支正式版。
+
+          - versionCode：${{ steps.ver.outputs.code }}
+          - 提交：${{ github.sha }}
+          - 构建：#${{ github.run_number }}
+
+          只支持 arm64-v8a（64 位安卓）。装不上先看 README 的「常见问题」。
+          EOF
+
+          gh release create "$TAG" app/build/outputs/apk/release/*.apk \
+            --repo "$GITHUB_REPOSITORY" \
+            --target "$GITHUB_SHA" \
+            --title "v$V (versionCode ${{ steps.ver.outputs.code }})" \
+            --notes-file /tmp/notes.md
+
+      # latest 只是一个「指向最新」的滚动指针，方便手机用固定链接下载；
+      # 真正的历史版本在版本化 tag 里，不受影响。
+      - name: 更新 latest 指针
+        if: github.event_name != 'pull_request' && github.ref == 'refs/heads/main'
         uses: softprops/action-gh-release@v2
         with:
           tag_name: latest
-          name: 最新构建（自动）
-          body: |
-            每次 main 有新提交都会更新这里。
-
-            · 只支持 arm64-v8a（64 位安卓）
-            · 首次打开需要联网，签名在本地完成，不连任何第三方服务器
-            · 装不上先看 README 的「常见问题」
+          name: 最新版 v${{ steps.ver.outputs.name }}
           prerelease: true
+          body: |
+            滚动指针，始终指向 main 最新一次构建（v${{ steps.ver.outputs.name }} / build ${{ github.run_number }}）。
+            需要固定某个版本，请到 Releases 列表里找对应的 vX.Y.Z。
           files: app/build/outputs/apk/release/*.apk
         env:
           GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
