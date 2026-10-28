@@ -112,7 +112,12 @@ final class PlayerEngine {
         s.file = file;
         s.plain = plain;
         s.ready = false;
-        if (s.player == null) s.player = buildPlayer(id);
+        if (s.player == null) {
+            s.player = buildPlayer(id);
+            // 必须把 player 绑到这一槽的 PlayerView 上：player 不绑 view 就没有 video
+            // surface 的消费者，ExoPlayer 会退化成"只有声音/空转"，画面永远是黑的。
+            if (s.view != null) s.view.setPlayer(s.player);
+        }
 
         ExoPlayer p = s.player;
         p.setPlaybackSpeed(1f);
@@ -194,6 +199,7 @@ final class PlayerEngine {
     void releaseAll() {
         for (Slot s : slots) {
             if (s.player != null) {
+                if (s.view != null) s.view.setPlayer(null);   // 先解绑再 release，免得 view 持有已释放的 player
                 s.player.release();
                 s.player = null;
             }
