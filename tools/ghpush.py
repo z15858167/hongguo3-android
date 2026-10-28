@@ -62,10 +62,13 @@ def req(method, path, payload=None, raw=False, ok404=False):
         with urllib.request.urlopen(r, timeout=120) as f:
             body = f.read().decode("utf-8")
     except urllib.error.HTTPError as e:
+        body = e.read().decode("utf-8", "replace")
         if ok404 and e.code == 404:
             return None
-        sys.exit("HTTP %s %s\n%s" % (e.code, method + " " + path,
-                                     e.read().decode("utf-8", "replace")[:800]))
+        if e.code == 422 and "pull request" in body:
+            sys.exit("main 有分支保护：不能直接推，请推到 dev，再用 "
+                     "`python3 tools/ghpush.py --merge` 合并 PR。")
+        sys.exit("HTTP %s %s\n%s" % (e.code, method + " " + path, body[:800]))
     if raw:
         return body
     return json.loads(body) if body else {}
@@ -230,7 +233,8 @@ def main():
     ap = argparse.ArgumentParser(add_help=True)
     ap.add_argument("msg", nargs="?", default="update")
     ap.add_argument("--branch", default=None)
-    ap.add_argument("--main", action="store_true", help="直接推 main（跳过 PR）")
+    ap.add_argument("--main", action="store_true",
+                    help="直接推 main（main 有分支保护，会被 GitHub 拒绝；正常请用 --merge）")
     ap.add_argument("--no-pr", action="store_true")
     ap.add_argument("--rm", nargs="*", default=[])
     ap.add_argument("--merge", action="store_true")
