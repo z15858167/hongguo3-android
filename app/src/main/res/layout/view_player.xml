@@ -1,0 +1,12 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!-- 播放器视图：surface 必须用 texture_view，
+     否则 SurfaceView 在平移动画里无法真正变换（换集会看到黑块/残帧）。 -->
+<androidx.media3.ui.PlayerView
+    xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:app="http://schemas.android.com/apk/res-auto"
+    android:layout_width="match_parent"
+    android:layout_height="match_parent"
+    android:background="@android:color/black"
+    app:resize_mode="fit"
+    app:surface_type="texture_view"
+    app:use_controller="false" />

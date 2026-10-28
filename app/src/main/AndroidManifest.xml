@@ -14,11 +14,14 @@
         android:theme="@style/Theme.Hongguo"
         android:usesCleartextTraffic="true">
 
+        <!-- 启动页 = feed 播放页（打开即播）；剧场是 MainActivity -->
         <activity
-            android:name=".MainActivity"
+            android:name=".PlayActivity"
             android:configChanges="orientation|screenSize|keyboardHidden|screenLayout"
             android:exported="true"
-            android:launchMode="singleTop">
+            android:launchMode="singleTop"
+            android:screenOrientation="portrait"
+            android:theme="@style/Theme.Hongguo.Player">
             <intent-filter>
                 <action android:name="android.intent.action.MAIN" />
                 <category android:name="android.intent.category.LAUNCHER" />
@@ -26,10 +29,11 @@
         </activity>
 
         <activity
-            android:name=".PlayActivity"
+            android:name=".MainActivity"
             android:configChanges="orientation|screenSize|keyboardHidden|screenLayout"
             android:exported="false"
-            android:theme="@style/Theme.Hongguo.Player" />
+            android:launchMode="singleTop"
+            android:screenOrientation="portrait" />
 
         <activity
             android:name=".SearchActivity"

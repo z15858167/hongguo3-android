@@ -8,7 +8,8 @@ import java.util.List;
 
 /**
  * 播放缓存管理。所有缓存都在内部 getCacheDir()：
- *   <vid>.<清晰度>.enc   流式播放的密文（StreamSource 边下边解，会预分配到整集大小）
+ *   <vid>.<清晰度>.enc   流式播放的密文（StreamSource 边下边解，**不再预分配**，文件长度 = 已下载字节）
+ *   <vid>.<清晰度>.enc.done  下载完成标记（有它才算"整集已缓存"，避免预分配造成的假完整）
  *   <vid>.<清晰度>.mp4   不支持边下边播时整集解密出的明文（Decryptor）
  *
  * 水位模型（一集短剧 80~200MB，下面的数值按"1GB 缓存区"设计）：
@@ -42,19 +43,33 @@ public final class Cache {
     /** 设备再挤也保留的最小额度（保证当前这一集能落盘、能拖动）。 */
     public static final long MIN_CAP = 128L * 1024 * 1024;
 
-    /** 正在播放/正在写的文件名，清理时跳过。 */
-    private static volatile String pinName;
+    /**
+     * 正在播放/正在写/预载中的文件名，清理时一律跳过。
+     * 双播放器（当前集 + 下一集预载）会同时持有两个文件，所以必须是集合而不是单槽。
+     */
+    private static final java.util.Set<String> PINS =
+            java.util.Collections.newSetFromMap(new java.util.concurrent.ConcurrentHashMap<String, Boolean>());
 
     private Cache() {
     }
 
-    /** 保护当前文件不被任何清理删掉（换集时重新 pin 新的）。 */
+    /** 保护文件不被任何清理删掉（正在播的、正在写的、预载的都要 pin）。 */
     public static void pin(File f) {
-        pinName = (f == null ? null : f.getName());
+        if (f != null) PINS.add(f.getName());
     }
 
-    public static void unpin() {
-        pinName = null;
+    /** 这一集不再需要了（换集 / 播完）就取消保护。 */
+    public static void unpin(File f) {
+        if (f != null) PINS.remove(f.getName());
+    }
+
+    /** 退出播放页：全部解除保护。 */
+    public static void unpinAll() {
+        PINS.clear();
+    }
+
+    public static boolean isPinned(String name) {
+        return name != null && PINS.contains(name);
     }
 
     public static List<File> list(File dir) {
@@ -126,10 +141,11 @@ public final class Cache {
         return ensure(dir, 0);
     }
 
-    /** 清空整个缓存目录，返回释放的字节数。 */
+    /** 清空整个缓存目录，返回释放的字节数（正在播的仍跳过，见 pin）。 */
     public static long clear(File dir) {
         long freed = 0;
         for (File f : list(dir)) {
+            if (isPinned(f.getName())) continue;
             long n = f.length();
             if (f.delete()) freed += n;
         }
@@ -190,7 +206,7 @@ public final class Cache {
         for (File f : fs) {
             if (total <= target) break;
             String n = f.getName();
-            if (pinName != null && pinName.equals(n)) continue;      // 正在播的这集不删
+            if (isPinned(n)) continue;      // 正在播的这集 / 预载的那一集不删
             if (!(n.endsWith(".enc") || n.endsWith(".mp4") || n.endsWith(".part"))) continue;
             long sz = f.length();
             if (f.delete()) {

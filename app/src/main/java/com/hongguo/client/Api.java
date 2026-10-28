@@ -56,8 +56,30 @@ public final class Api {
     private static JSONObject baseQuery;
     private static JSONObject sessionHeaders;
 
-    private static final ExecutorService POOL = Executors.newFixedThreadPool(4);
+    private static final ExecutorService POOL = Executors.newFixedThreadPool(6);
     private static final Handler UI = new Handler(Looper.getMainLooper());
+
+    // ---- 接口结果缓存：切集/回上一集时不该再走一次签名 + 网络 ----
+    /** 剧集详情：24 部，60 分钟。 */
+    private static final android.util.LruCache<String, Entry<Model.Detail>> EP_CACHE =
+            new android.util.LruCache<>(24);
+    /** 播放地址：128 集，20 分钟（直链有时效，别缓存太久）。 */
+    private static final android.util.LruCache<String, Entry<List<Model.Track>>> TRACK_CACHE =
+            new android.util.LruCache<>(128);
+
+    private static final long TTL_EP = 60L * 60 * 1000;
+    private static final long TTL_TRACK = 20L * 60 * 1000;
+
+    private static final class Entry<T> {
+        final T v;
+        final long at = System.currentTimeMillis();
+        Entry(T v) {
+            this.v = v;
+        }
+        boolean fresh(long ttl) {
+            return System.currentTimeMillis() - at < ttl;
+        }
+    }
 
     public interface Cb<T> {
         void ok(T v);
@@ -825,6 +847,15 @@ public final class Api {
     }
 
     public static Model.Detail episodes(String seriesId) throws Exception {
+        if (seriesId == null || seriesId.isEmpty()) throw new IOException("series_id 为空");
+        Entry<Model.Detail> hit = EP_CACHE.get(seriesId);
+        if (hit != null && hit.fresh(TTL_EP)) return hit.v;
+        Model.Detail d = episodesNet(seriesId);
+        EP_CACHE.put(seriesId, new Entry<>(d));
+        return d;
+    }
+
+    private static Model.Detail episodesNet(String seriesId) throws Exception {
         JSONObject j = requestEither("POST", "/novel/player/multi_video_detail/v1/",
                 episodeBody(seriesId), null, true);
         JSONObject data = j.optJSONObject("data");
@@ -860,6 +891,14 @@ public final class Api {
 
     // ---------------- 播放地址 ----------------
     public static List<Model.Track> tracks(String vid) throws Exception {
+        Entry<List<Model.Track>> hit = TRACK_CACHE.get(vid);
+        if (hit != null && hit.fresh(TTL_TRACK)) return hit.v;
+        List<Model.Track> out = tracksNet(vid);
+        if (!out.isEmpty()) TRACK_CACHE.put(vid, new Entry<>(out));
+        return out;
+    }
+
+    private static List<Model.Track> tracksNet(String vid) throws Exception {
         JSONObject biz = new JSONObject();
         biz.put("detail_page_version", 0);
         biz.put("device_level", 3);
