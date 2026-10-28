@@ -94,6 +94,10 @@ public class PlayActivity extends AppCompatActivity {
     private int curStartSec;
     private boolean fullscreen;
 
+    // 缓存生命周期：本集密文/明文文件 + 是否看完（看完的保留，方便秒开重看）
+    private File curEnc, curPlain;
+    private boolean watchedAll;
+
     // ---------------- 手势 ----------------
     private static final int G_NONE = 0, G_SEEK = 1, G_BRIGHT = 2, G_VOL = 3;
     private int gMode = G_NONE;
@@ -859,10 +863,15 @@ public class PlayActivity extends AppCompatActivity {
         String tag = ep.vid + "." + safe(t.definition);
         File plain = new File(getCacheDir(), tag + ".mp4");
         if (plain.exists() && plain.length() > 1024) {
+            Cache.touch(plain);          // 命中：刷新 LRU 时间，别被淘汰掉
+            curPlain = plain;
             startPlayFile(plain, startSec);
             return;
         }
         File enc = new File(getCacheDir(), tag + ".enc");
+        curEnc = enc;
+        // 写盘前先做一次淘汰，避免整集预分配把磁盘吃满
+        Cache.trim(getCacheDir(), Cache.limit(getCacheDir()));
 
         setStatus("正在打开…");
         Api.run(() -> {
@@ -884,9 +893,13 @@ public class PlayActivity extends AppCompatActivity {
     /** 流式播放：ExoPlayer 要多少解多少。 */
     private void startStream(Model.Track t, String key, File enc, int startSec, Model.Episode ep) {
         if (stream != null) {
+            // 换集：上一集没看完的缓存直接删掉（看完整集的明文另算，见 onDestroy）
+            File old = stream.cacheFile();
             stream.release();
             stream = null;
+            if (old != null && !watchedAll) old.delete();
         }
+        watchedAll = false;
         StreamSource src = new StreamSource(t.url, key, enc, "full",
                 (done, total, doneAll) -> {
                     if (doneAll) return;
@@ -957,6 +970,7 @@ public class PlayActivity extends AppCompatActivity {
 
     /** 播放已解密好的本地明文（回退路径 / 旧缓存）。 */
     private void startPlayFile(File f, int startSec) {
+        curPlain = f;
         runOnUiThread(() -> {
             status.setVisibility(View.GONE);
             if (player == null) buildPlayer();
@@ -980,6 +994,7 @@ public class PlayActivity extends AppCompatActivity {
                     if (controlsShown) tick();
                 }
                 if (state != Player.STATE_ENDED) return;
+                watchedAll = true;      // 看完了：这集的缓存保留
                 if (autoNext) {
                     playNext();
                 } else if (detail != null) {
@@ -1077,7 +1092,10 @@ public class PlayActivity extends AppCompatActivity {
     private void saveProgress() {
         if (player == null || detail == null) return;
         try {
-            int t = (int) (player.getCurrentPosition() / 1000L);
+            long pos = player.getCurrentPosition();
+            long dur = player.getDuration();
+            if (dur > 0 && pos >= (long) (dur * 0.92)) watchedAll = true;
+            int t = (int) (pos / 1000L);
             Store.recordHist(this, sid, title, cover, curEp, detail.episodeCnt, t);
         } catch (Throwable ignored) {
         }
@@ -1086,6 +1104,12 @@ public class PlayActivity extends AppCompatActivity {
     @Override
     protected void onDestroy() {
         ui.removeCallbacksAndMessages(null);
+        // 没看完的这集：缓存直接清掉（看了一半划走不留残留）；看完的保留以便秒开重看
+        if (!watchedAll) {
+            if (curEnc != null) curEnc.delete();
+            if (curPlain != null) curPlain.delete();
+        }
+        Cache.trim(getCacheDir(), Cache.limit(getCacheDir()));
         // 还原进入时的系统亮度
         if (baseBrightness >= 0) {
             android.view.WindowManager.LayoutParams lp = getWindow().getAttributes();

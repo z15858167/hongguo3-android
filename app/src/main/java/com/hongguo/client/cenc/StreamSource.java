@@ -50,6 +50,11 @@ public final class StreamSource implements DataSource {
     private Ranger ranger;
     private RandomAccessFile raf;
 
+    /** 缓存文件（getCacheDir 下的 .enc），供播放页退出时精确清理。 */
+    public File cacheFile() {
+        return cache;
+    }
+
     private volatile long downloaded;
     private volatile boolean finished;
     private volatile boolean failed;

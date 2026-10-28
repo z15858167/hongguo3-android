@@ -35,6 +35,9 @@ public class SearchActivity extends AppCompatActivity {
     private ProgressBar bar;
     private TextView empty;
     private ItemsAdapter adapter;
+    /** 搜索序号：连点回车/切换关键词时，旧请求的结果不再覆盖新的。 */
+    private int seq;
+    private int limit = 20;
 
     @Override
     protected void onCreate(Bundle b) {
@@ -147,30 +150,58 @@ public class SearchActivity extends AppCompatActivity {
         grid.setVisibility(View.GONE);
         adapter.set(new ArrayList<>());
 
-        Api.run(() -> Api.search(q, 40), new Api.Cb<List<Model.Item>>() {
-            @Override
-            public void ok(List<Model.Item> v) {
-                bar.setVisibility(View.GONE);
-                if (v == null || v.isEmpty()) {
-                    empty.setText("没搜到「" + q + "」\n换个关键词试试（剧名的一部分也行）");
-                    empty.setVisibility(View.VISIBLE);
-                    return;
-                }
-                empty.setVisibility(View.GONE);
-                grid.setVisibility(View.VISIBLE);
-                adapter.set(v);
-                grid.scrollToPosition(0);
-            }
+        final int my = ++seq;
+        final boolean[] first = {true};
+        Stats.searchStart();
+        // 先要 20 条（2 页）尽快出结果；后续批次由 sink 推送，后台续拉到 40
+        Api.run(() -> Api.search(q, limit, (batch, done) -> {
+                    runOnUiThread(() -> {
+                        if (my != seq) return;
+                        if (first[0]) Stats.searchFirstResult();
+                        render(my, first, q, batch, done);
+                    });
+                }),
+                new Api.Cb<List<Model.Item>>() {
+                    @Override
+                    public void ok(List<Model.Item> v) {
+                        runOnUiThread(() -> render(my, first, q, v, true));
+                    }
 
-            @Override
-            public void err(Exception e) {
-                bar.setVisibility(View.GONE);
-                empty.setText("搜索失败\n" + (e.getMessage() == null ? e.toString() : e.getMessage())
-                        + "\n\n点这里重试");
+                    @Override
+                    public void err(Exception e) {
+                        if (my != seq) return;
+                        bar.setVisibility(View.GONE);
+                        if (first[0]) {
+                            empty.setText("搜索失败\n"
+                                    + (e.getMessage() == null ? e.toString() : e.getMessage())
+                                    + "\n\n点这里重试");
+                            empty.setVisibility(View.VISIBLE);
+                            empty.setOnClickListener(x -> doSearch());
+                        }
+                    }
+                });
+    }
+
+    /** 第一批 set + 滚动到顶，后续批次只替换数据（避免重复条目）。 */
+    private void render(int my, boolean[] first, String q, List<Model.Item> v, boolean done) {
+        if (my != seq) return;
+        bar.setVisibility(View.GONE);
+        if (v == null || v.isEmpty()) {
+            if (first[0]) {
+                empty.setText("没搜到「" + q + "」\n换个关键词试试（剧名的一部分也行）");
                 empty.setVisibility(View.VISIBLE);
-                empty.setOnClickListener(x -> doSearch());
             }
-        });
+            return;
+        }
+        empty.setVisibility(View.GONE);
+        grid.setVisibility(View.VISIBLE);
+        if (first[0]) {
+            first[0] = false;
+            adapter.set(v);
+            grid.scrollToPosition(0);
+        } else {
+            adapter.set(v);
+        }
     }
 
     private void toast(String s) {

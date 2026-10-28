@@ -41,6 +41,8 @@ public class MainActivity extends AppCompatActivity {
     private ItemsAdapter adapter;
     private String cur = "recommend";
     private boolean loaded;
+    /** 每次 load() 自增，避免快速切 tab 时旧请求回来把新结果覆盖掉。 */
+    private int session;
 
     @Override
     protected void onCreate(Bundle b) {
@@ -51,7 +53,21 @@ public class MainActivity extends AppCompatActivity {
         } catch (Exception e) {
             toast("初始化失败: " + e);
         }
+        trimCacheAsync();
         select(0);
+    }
+
+    /** 启动时后台做一次缓存淘汰（上限见 Cache.limit，默认 512MB）。 */
+    private void trimCacheAsync() {
+        new Thread(() -> {
+            try {
+                long freed = Cache.trim(getCacheDir(), Cache.limit(getCacheDir()));
+                if (freed > 0) {
+                    Stats.note("启动时自动清理缓存 " + Cache.fmt(freed));
+                }
+            } catch (Throwable ignored) {
+            }
+        }, "hg-cache").start();
     }
 
     @Override
@@ -96,6 +112,7 @@ public class MainActivity extends AppCompatActivity {
         clearBtn = action("清空", v -> clearCurrent());
         clearBtn.setVisibility(View.GONE);
         top.addView(clearBtn);
+        top.addView(action("缓存", v -> showCache()));
         top.addView(action("诊断", v -> showDiag()));
         root.addView(top);
 
@@ -199,6 +216,7 @@ public class MainActivity extends AppCompatActivity {
 
     private void load() {
         loaded = false;
+        final int my = ++session;
         bar.setVisibility(View.VISIBLE);
         empty.setVisibility(View.GONE);
         empty.setOnClickListener(null);
@@ -221,19 +239,37 @@ public class MainActivity extends AppCompatActivity {
         }
 
         final String board = cur;
-        Api.run(() -> Api.rank(board, 60), new Api.Cb<List<Model.Item>>() {
-            @Override
-            public void ok(List<Model.Item> v) {
-                if (!board.equals(cur)) return;
-                show(v, "榜单为空");
-            }
+        final boolean[] first = {true};
+        Api.run(() -> Api.rank(board, 60, (batch, done) -> {
+                    // 榜单分页是串行的，这里每一轮结束就把"目前为止的全部条目"推过来先渲染，
+                    // 后面的轮次后台续拉 —— 首屏不再等 60 条全齐
+                    runOnUiThread(() -> render(my, first, batch, done));
+                }),
+                new Api.Cb<List<Model.Item>>() {
+                    @Override
+                    public void ok(List<Model.Item> v) {
+                        runOnUiThread(() -> render(my, first, v, true));
+                    }
 
-            @Override
-            public void err(Exception e) {
-                if (!board.equals(cur)) return;
-                fail(e);
-            }
-        });
+                    @Override
+                    public void err(Exception e) {
+                        if (my != session) return;
+                        fail(e);
+                    }
+                });
+    }
+
+    /** 分批渲染：第一批走 show()（带进度条/空态处理），后续只替换数据不再滚动到顶。 */
+    private void render(int my, boolean[] first, List<Model.Item> v, boolean done) {
+        if (my != session) return;
+        if (first[0]) {
+            first[0] = false;
+            show(v, "榜单为空");
+            return;
+        }
+        if (v == null || v.isEmpty()) return;
+        adapter.set(v);
+        if (done) bar.setVisibility(View.GONE);
     }
 
     private void show(List<Model.Item> list, String tip) {
@@ -249,6 +285,7 @@ public class MainActivity extends AppCompatActivity {
         grid.setVisibility(View.VISIBLE);
         adapter.set(list);
         grid.scrollToPosition(0);
+        Stats.firstPaint();
     }
 
     private void fail(Exception e) {
@@ -261,8 +298,32 @@ public class MainActivity extends AppCompatActivity {
         empty.setOnClickListener(v -> load());
     }
 
+    /** 缓存占用 + 一键清空。 */
+    private void showCache() {
+        java.io.File dir = getCacheDir();
+        long total = Cache.size(dir);
+        StringBuilder detail = new StringBuilder();
+        for (java.io.File f : Cache.top(dir, 5)) {
+            detail.append(f.getName()).append("  ").append(Cache.fmt(f.length())).append('\n');
+        }
+        String msg = "当前缓存 " + Cache.fmt(total) + "（上限 " + Cache.fmt(Cache.limit(dir)) + "）\n"
+                + "文件数 " + Cache.list(dir).size() + "\n\n"
+                + (detail.length() > 0 ? "最大的几个：\n" + detail : "（暂无缓存）\n")
+                + "\n播放产生的临时文件会在离开播放页和超过上限时自动清理。";
+        new AlertDialog.Builder(this)
+                .setTitle("缓存")
+                .setMessage(msg)
+                .setNegativeButton("关闭", null)
+                .setPositiveButton("清空缓存", (d, w) -> {
+                    long freed = Cache.clear(getCacheDir());
+                    toast("已释放 " + Cache.fmt(freed));
+                })
+                .show();
+    }
+
     private void showDiag() {
         StringBuilder sb = new StringBuilder();
+        sb.append(Stats.report(this)).append('\n');
         sb.append("签名状态\n").append(Signer.status()).append("\n\n");
         sb.append("接口口径（实测）\n");
         sb.append("榜单：免签可用\n");

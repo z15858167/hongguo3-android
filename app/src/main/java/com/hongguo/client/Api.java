@@ -156,15 +156,16 @@ public final class Api {
             throws Exception {
         HttpURLConnection c = (HttpURLConnection) new URL(url).openConnection();
         c.setRequestMethod(method);
-        c.setConnectTimeout(15000);
-        c.setReadTimeout(30000);
+        c.setConnectTimeout(8000);
+        c.setReadTimeout(15000);
         c.setInstanceFollowRedirects(true);
         for (Map.Entry<String, String> e : headers.entrySet()) {
             String v = e.getValue();
             if (v == null || v.isEmpty()) continue;
             c.setRequestProperty(e.getKey(), v);
         }
-        c.setRequestProperty("Accept-Encoding", "identity");
+        // 不再写死 identity：JSON 接口走 gzip（HttpURLConnection 会自动解压），
+        // 榜单/详情响应体小一个量级。下载视频仍用 identity（见 download()，要 Content-Length 算进度）
         if (body != null) {
             c.setDoOutput(true);
             c.setFixedLengthStreamingMode(body.length);
@@ -234,12 +235,23 @@ public final class Api {
 
     // ---------------- 榜单 ----------------
     public static List<Model.Item> rank(String board, int limit) throws Exception {
+        return rank(board, limit, null);
+    }
+
+    /**
+     * 榜单。分页是串行的（下一轮 offset 依赖上一轮 next_offset），为了不再"等 60 条全齐才显示"，
+     * 加了一个 sink：每攒够 firstBatch 条或每轮结束就回调一次，调用方先渲染再后台续拉。
+     */
+    public static List<Model.Item> rank(String board, int limit, Sink<List<Model.Item>> sink)
+            throws Exception {
         String sub = RANK_BOARDS.get(board);
         if (sub == null) sub = RANK_BOARDS.get("hot");
         List<Model.Item> out = new ArrayList<>();
         int offset = 0;
         String sess = UUID.randomUUID().toString();
+        Stats.clearRounds();
         for (int guard = 0; guard < 8 && out.size() < limit; guard++) {
+            long t0 = System.currentTimeMillis();
             Map<String, String> q = new LinkedHashMap<>();
             q.put("cell_id", RANK_CELL);
             q.put("tab_type", "26");
@@ -251,8 +263,11 @@ public final class Api {
             q.put("session_uuid", sess);
             if (offset > 0) q.put("offset", String.valueOf(offset));
 
-            JSONObject j = requestEither("GET", "/reading/bookapi/bookmall/cell/change/v",
+            // 榜单实测免签即可用；锁死免签单次，不再"免签无 data 再签名重试"
+            // （那样每轮可能翻倍，还会把首次 dlopen so 拖进首屏）
+            JSONObject j = request("GET", "/reading/bookapi/bookmall/cell/change/v",
                     null, q, false);
+            Stats.round(System.currentTimeMillis() - t0);
             JSONObject data = j.optJSONObject("data");
             JSONObject cv = data == null ? null : data.optJSONObject("cell_view");
             JSONArray cells = cv == null ? null : cv.optJSONArray("cell_data");
@@ -284,6 +299,8 @@ public final class Api {
                 it.intro = cut(vd.optString("video_desc", ""), 50);
                 out.add(it);
             }
+            // 每轮结束就把已攒到的条目推给调用方先渲染
+            if (sink != null) sink.push(new ArrayList<>(out), out.size() >= limit);
             if (cv != null && !cv.optBoolean("has_more", false)) break;
             int next = cv == null ? offset : cv.optInt("next_offset", offset + cells.length());
             if (next == offset) break;
@@ -303,21 +320,28 @@ public final class Api {
      *    其余 pic_url 是同一张灰色占位图 —— 这就是"搜出一堆但只有前几个有封面"的根因。
      */
     public static List<Model.Item> search(String query, int limit) throws Exception {
+        return search(query, limit, null);
+    }
+
+    /**
+     * @param sink 不为 null 时，每拿到一批就回调一次（首次回调通常是第一页的 10 条），
+     *             调用方可以先把这批渲染出来，剩下的后台续拉——搜索不再"等全部翻完才出结果"。
+     */
+    public static List<Model.Item> search(String query, int limit, Sink<List<Model.Item>> sink)
+            throws Exception {
         List<Model.Item> out = new ArrayList<>();
         try {
-            out = webSearch(query, limit);
+            out = webSearch(query, limit, sink);
         } catch (Exception e) {
             Log.d(TAG, "官网搜索不可用: " + e);
         }
-        if (out.isEmpty()) {
-            try {
-                out = searchTab(query, limit);
-            } catch (Exception e) {
-                Log.d(TAG, "search/tab 不可用: " + e);
-            }
-        }
-        if (out.isEmpty()) out = searchSuggest(query, limit);
+        // searchTab 上游已下线（返回空 body），不再串行降级，省掉一次注定失败且要签名的请求。
+        if (out.isEmpty()) out = searchSuggest(query, limit, sink);
         return out;
+    }
+
+    public interface Sink<T> {
+        void push(T v, boolean done);
     }
 
     // ---- 官网网页版搜索：GET /api/search/result，免签、约 200ms、每页 10 条 ----
@@ -327,20 +351,32 @@ public final class Api {
             + "AppleWebKit/537.36 (KHTML, like Gecko) Chrome/126.0.0.0 Safari/537.36";
 
     private static List<Model.Item> webSearch(String query, int limit) throws Exception {
+        return webSearch(query, limit, null);
+    }
+
+    private static List<Model.Item> webSearch(String query, int limit,
+                                              Sink<List<Model.Item>> sink) throws Exception {
         List<Model.Item> out = new ArrayList<>();
         Set<String> seen = new HashSet<>();
         for (int page = 1; page <= 8 && out.size() < limit; page++) {
             String url = WEB_BASE + "/api/search/result?aid=" + WEB_AID
                     + "&query=" + URLEncoder.encode(query, "UTF-8")
                     + "&page=" + page;
+            long t0 = System.currentTimeMillis();
             JSONObject j;
             try {
                 j = webGet(url);
+            } catch (NoMorePage e) {
+                // 200 + 空 body = 没有更多页：直接收尾，不再翻页（之前会重试 4 次并白睡 2s）
+                Stats.page("第" + page + "页 空body(无更多)", System.currentTimeMillis() - t0);
+                break;
             } catch (Exception e) {
-                // 某一页挂了（官网偶发 502）就停止翻页，已有的结果照常返回
                 Log.d(TAG, "官网搜索第 " + page + " 页失败: " + e);
+                Stats.page("第" + page + "页 失败:" + e.getMessage(), System.currentTimeMillis() - t0);
                 break;
             }
+            Stats.page("第" + page + "页", System.currentTimeMillis() - t0);
+
             JSONArray lst = j.optJSONArray("searchList");
             if (lst == null || lst.length() == 0) break;
             for (int i = 0; i < lst.length() && out.size() < limit; i++) {
@@ -348,9 +384,17 @@ public final class Api {
                 if (it == null || !seen.add(it.seriesId)) continue;
                 out.add(it);
             }
+            if (sink != null) sink.push(new ArrayList<>(out), out.size() >= limit);
             if (!j.optBoolean("hasMore", false)) break;
         }
         return out;
+    }
+
+    /** 官网返回 200 但 body 为空：表示翻到没有更多页了，不是错误。 */
+    private static class NoMorePage extends Exception {
+        NoMorePage() {
+            super("空body");
+        }
     }
 
     private static Model.Item parseWebCell(JSONObject x) {
@@ -376,33 +420,49 @@ public final class Api {
         return it;
     }
 
-    /** 官网接口偶发 502 / 空 body（翻页快时更明显），带退避重试。 */
+    /**
+     * 官网接口偶发 502，所以只对 **5xx / 超时 / IO 异常** 重试（3 次，退避 0/150/300ms，
+     * 最后一次失败后不再 sleep）；HTTP 200 但空 body 视为"没有更多页"，抛 NoMorePage 不重试。
+     * 之前空 body 也走 4 次重试 + 固定 2.0s 退避，是搜索慢的主因。
+     */
     private static JSONObject webGet(String url) throws Exception {
         String last = "未知";
-        for (int i = 0; i < 4; i++) {
+        for (int i = 0; i < 3; i++) {
             HttpURLConnection c = null;
             try {
                 c = (HttpURLConnection) new URL(url).openConnection();
-                c.setConnectTimeout(12000);
-                c.setReadTimeout(12000);
+                c.setConnectTimeout(4000);
+                c.setReadTimeout(6000);
                 c.setRequestProperty("User-Agent", WEB_UA);
                 c.setRequestProperty("Accept", "application/json, text/plain, */*");
                 c.setRequestProperty("Accept-Language", "zh-CN,zh;q=0.9");
                 c.setRequestProperty("Referer", WEB_BASE + "/");
                 c.setRequestProperty("Origin", WEB_BASE);
-                if (c.getResponseCode() == 200) {
+                int code = c.getResponseCode();
+                if (code == 200) {
                     String s = slurp(c.getInputStream());
                     if (s != null && !s.trim().isEmpty()) return new JSONObject(s);
-                    last = "空body";
+                    throw new NoMorePage();          // 没有更多页，不重试
+                }
+                last = "HTTP " + code;
+                if (code >= 400 && code < 500) {     // 4xx 重试也没用
+                    throw new IOException("官网搜索失败(" + last + ")");
+                }
+            } catch (NoMorePage e) {
+                throw e;
+            } catch (IOException e) {
+                if (e instanceof java.net.SocketTimeoutException
+                        || e instanceof java.net.ConnectException) {
+                    last = e.toString();
                 } else {
-                    last = "HTTP " + c.getResponseCode();
+                    throw e;
                 }
             } catch (Exception e) {
                 last = e.toString();
             } finally {
                 if (c != null) c.disconnect();
             }
-            Thread.sleep(200L * (i + 1));
+            if (i < 2) Thread.sleep(150L * i);   // 第 1 次失败不睡，第 2 次睡 150ms
         }
         throw new IOException("官网搜索失败(" + last + ")");
     }
@@ -512,6 +572,11 @@ public final class Api {
 
     /** 联想接口兜底：2026-10 起 search/tab 对客户端返回空 body，suggest 仍可用。 */
     private static List<Model.Item> searchSuggest(String query, int limit) throws Exception {
+        return searchSuggest(query, limit, null);
+    }
+
+    private static List<Model.Item> searchSuggest(String query, int limit,
+                                                  Sink<List<Model.Item>> sink) throws Exception {
         Map<String, String> q = new LinkedHashMap<>();
         q.put("query", query);
         JSONObject j = requestEither("GET", "/reading/bookapi/search/suggest/v", null, q, true);
@@ -547,6 +612,7 @@ public final class Api {
                     : it.optString("sug_abstract", ""), 50);
             out.add(m);
         }
+        if (sink != null) sink.push(new ArrayList<>(out), true);
         return out;
     }
 
