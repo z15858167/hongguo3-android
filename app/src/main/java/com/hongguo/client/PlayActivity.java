@@ -480,7 +480,14 @@ public class PlayActivity extends AppCompatActivity {
         epBlock.setOrientation(LinearLayout.VERTICAL);
         epBlock.addView(label("选集"));
         epGrid = new RecyclerView(this);
-        epGrid.setLayoutManager(new GridLayoutManager(this, 6));
+        GridLayoutManager glm = new GridLayoutManager(this, 6);
+        glm.setSpanSizeLookup(new GridLayoutManager.SpanSizeLookup() {
+            @Override
+            public int getSpanSize(int position) {
+                return epAdapter != null && epAdapter.isHeader(position) ? 6 : 1;
+            }
+        });
+        epGrid.setLayoutManager(glm);
         epGrid.setPadding(0, dp(6), 0, dp(6));
         epAdapter = new EpAdapter();
         epGrid.setAdapter(epAdapter);
@@ -1552,6 +1559,10 @@ public class PlayActivity extends AppCompatActivity {
                 if (o instanceof Model.Episode && ((Model.Episode) o).index == epIndex) return i;
             }
             return -1;
+        }
+
+        boolean isHeader(int pos) {
+            return pos >= 0 && pos < rows.size() && rows.get(pos) instanceof String;
         }
 
         @Override
