@@ -84,6 +84,24 @@ final class FeedQueue {
         return i >= 0 && i < items.size() ? items.get(i) : null;
     }
 
+    /** 下一部剧的第一集（feed 预载用；没有则 null）。 */
+    Item peekNextSeries() {
+        Item cur = current();
+        if (cur == null) return null;
+        for (int i = cursor + 1; i < items.size(); i++) {
+            if (!cur.sid.equals(items.get(i).sid)) return items.get(i);
+        }
+        return null;
+    }
+
+    int cursorIndex() {
+        return cursor;
+    }
+
+    void cursor(int i) {
+        if (i >= 0 && i < items.size()) cursor = i;
+    }
+
     /** 移动游标；越界返回 false（调用方据此回弹/提示）。 */
     boolean advance(int dir) {
         int i = cursor + dir;
@@ -96,6 +114,42 @@ final class FeedQueue {
     /** 后面还有没有（同剧的下一集 or 下一部剧）。 */
     boolean hasNext() {
         return peekNext() != null || feed;
+    }
+
+    /** 当前这部剧的第一集在列表里的位置（没有则 -1）。 */
+    private int firstOfSeries(String sid) {
+        for (int i = 0; i < items.size(); i++) {
+            if (sid.equals(items.get(i).sid)) return i;
+        }
+        return -1;
+    }
+
+    /**
+     * 首页 feed 里上下滑：整部剧跳，不是集跳。
+     * dir=1 落到下一部剧的第 1 集，dir=-1 落到上一部剧的第 1 集。
+     * 越界返回 false（调用方负责回弹/提示/预取）。
+     */
+    boolean advanceSeries(int dir) {
+        Item cur = current();
+        if (cur == null) return false;
+        if (dir > 0) {
+            for (int i = cursor + 1; i < items.size(); i++) {
+                if (!cur.sid.equals(items.get(i).sid)) {
+                    cursor = i;          // 摊平后新剧的第一条正好是第 1 集
+                    trim();
+                    return true;
+                }
+            }
+            return false;
+        }
+        for (int i = cursor - 1; i >= 0; i--) {
+            if (!cur.sid.equals(items.get(i).sid)) {
+                int first = firstOfSeries(items.get(i).sid);
+                cursor = first < 0 ? i : first;
+                return true;
+            }
+        }
+        return false;
     }
 
     /** 定位到某一集的 vid（剧场点进来时续播用），找不到返回 false。 */
