@@ -146,8 +146,9 @@ python3 tools/ghpush.py --status
 `versionName` 是版本号来源：发正式版前记得在 `app/build.gradle` 里把
 `versionCode` 和 `versionName` 一起加上去，否则同名版本会退化成 `vX.Y.Z-b<run>`。
 
-> 千万别直接往 `main` 推（`--main` 只留给紧急修复），`main` 上的每一次提交都会
-> 直接变成一个对外发布的正式版本。
+> `main` 已开启分支保护（对 admin 也生效）：直接推会被 GitHub 拒绝
+> （`Changes must be made through a pull request`），只能走 `dev → PR → 合并`。
+> 确实需要绕过时，在仓库 Settings → Branches 里临时关掉保护。
 
 不装环境也行：推一个 commit，GitHub Actions 会编译并发布。
 
