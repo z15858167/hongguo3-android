@@ -42,6 +42,9 @@ final class PlayerEngine {
         void onSlotError(int slot, Exception e);
 
         void onSlotBuffer(int slot, long done, long total, boolean doneAll);
+
+        /** 画面尺寸变化（决定 zoom/fit）。 */
+        void onVideoSize(int w, int h);
     }
 
     static final class Slot {
@@ -73,6 +76,8 @@ final class PlayerEngine {
     private FrameLayout host;
     /** 当前"在台上"的槽：load 完成时靠它决定要不要直接开播（应对超时换台的场景）。 */
     private int activeId = 0;
+    /** 最近一次上报的画面宽高（0 = 还没拿到）。 */
+    private volatile int vidW, vidH;
 
     /** 低内存设备：关掉预载、缩小缓冲，宁可慢一点也别被系统回收。 */
     private final boolean lowRam;
@@ -108,10 +113,6 @@ final class PlayerEngine {
         return preloadOn;
     }
 
-    boolean isLowRam() {
-        return lowRam;
-    }
-
     void attach(FrameLayout stage) {
         host = stage;
         for (Slot s : slots) {
@@ -131,13 +132,16 @@ final class PlayerEngine {
         return slots[id];
     }
 
-    boolean isReady(int id) {
-        Slot s = slots[id];
-        return s.ready && s.player != null;
-    }
-
     PlayerView view(int id) {
         return slots[id].view;
+    }
+
+    int videoWidth() {
+        return vidW;
+    }
+
+    int videoHeight() {
+        return vidH;
     }
 
     /** 载入一条：file 为密文缓存（plain=false，走 StreamSource）或已解密明文（plain=true）。 */
@@ -145,6 +149,9 @@ final class PlayerEngine {
               File file, boolean plain, int startSec, boolean preload) {
         Slot s = slots[id];
         releaseStream(s);
+        // 这一槽原先持有的文件要解保护，否则每换一次内容就多钉住一个文件，
+        // 缓存清理永远删不掉它们（直到退出播放页 unpinAll）。
+        if (s.file != null && !s.file.equals(file)) Cache.unpin(s.file);
         s.item = item;
         s.track = track;
         s.file = file;
@@ -239,6 +246,14 @@ final class PlayerEngine {
             }
             releaseStream(s);
             s.ready = false;
+            // 条目/文件也要清干净：残留的 item 会让 preloadNext() 误以为"这一槽已经是下一条"，
+            // 残留的 file 会让缓存一直处于 pin 状态。
+            s.item = null;
+            s.track = null;
+            if (s.file != null) {
+                Cache.unpin(s.file);
+                s.file = null;
+            }
             if (s.view != null) s.view.setVisibility(android.view.View.INVISIBLE);
         }
     }
@@ -283,6 +298,14 @@ final class PlayerEngine {
                 slots[id].ready = false;
                 slots[id].errCount++;
                 if (listener != null) listener.onSlotError(id, error);
+            }
+
+            @Override
+            public void onVideoSizeChanged(androidx.media3.common.VideoSize size) {
+                if (size.width <= 0 || size.height <= 0) return;
+                vidW = size.width;
+                vidH = size.height;
+                if (listener != null) listener.onVideoSize(vidW, vidH);
             }
         });
         return p;

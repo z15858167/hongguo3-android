@@ -122,7 +122,13 @@ gradle assembleRelease   # 产物 app/build/outputs/apk/release/app-release.apk
 不装环境也行：推一个 commit，GitHub Actions 会编译 + 发布到 `latest` 预发布（`build-android`）。
 历史构建产物在 Actions 的 Artifacts 里保留 30 天。
 
-release 用的是 AGP 自带 debug 签名，可直接 `adb install`。
+release 用仓库里的固定 key（`keystore/hongguo.jks`）签名，可直接 `adb install` 覆盖升级。
+
+> **为什么要固定 key**：AGP 的 debug 签名在每台机器、每次 CI 都是**新生成**的，
+> 换个构建环境出的 APK 签名就变了，覆盖安装必然报
+> `INSTALL_FAILED_UPDATE_INCOMPATIBLE`（与已安装的应用签名不同）。
+> 现在本机 Debug / CI Release 共用同一把 key，可以互相覆盖。
+> 若之前装过旧签名版本，需要**卸载一次**再装新的（一次性）。
 
 ### 推送前的本地体检（必跑，ghpush 自动带上）
 

@@ -1,6 +1,5 @@
 package com.hongguo.client;
 
-import android.animation.ValueAnimator;
 import android.content.Context;
 import android.content.Intent;
 import android.graphics.Canvas;
@@ -8,7 +7,6 @@ import android.graphics.Color;
 import android.graphics.Paint;
 import android.graphics.drawable.ColorDrawable;
 import android.graphics.drawable.GradientDrawable;
-import android.net.Uri;
 import android.os.Bundle;
 import android.os.Handler;
 import android.os.Looper;
@@ -17,19 +15,14 @@ import android.view.Gravity;
 import android.view.MotionEvent;
 import android.view.View;
 import android.view.ViewGroup;
-import android.view.animation.DecelerateInterpolator;
 import android.widget.FrameLayout;
 import android.widget.HorizontalScrollView;
 import android.widget.LinearLayout;
 import android.widget.PopupWindow;
-import android.widget.ScrollView;
 import android.widget.TextView;
 import android.widget.Toast;
 
-import androidx.annotation.NonNull;
 import androidx.appcompat.app.AppCompatActivity;
-import androidx.recyclerview.widget.GridLayoutManager;
-import androidx.recyclerview.widget.RecyclerView;
 
 import com.hongguo.client.cenc.Decryptor;
 import com.hongguo.client.cenc.Spade;
@@ -40,15 +33,16 @@ import java.util.Collections;
 import java.util.List;
 
 /**
- * 播放页（v0.7.0）：对齐原生红果的两段式。
+ * 播放页：对齐原生红果的两段式。
  *
- *  第一段 feed（启动即进入）：视频铺满整屏（按片源比例 fit，横屏上下留黑），
- *    左下叠剧名/标签/「第N集 | 简介」/观看完整短剧，右侧追剧，底部 首页|剧场。
- *    上下滑 = 整部剧切换（跟手），单击 = 显隐信息层，双击 = 暂停，长按 = 2 倍速。
+ *  第一段 feed（启动即进入）：视频铺满整屏（竖屏片源 center-crop，横屏片源才留黑），
+ *    左下叠剧名/标签/「第N集 | 简介」/观看完整短剧，右下追剧，底部 首页|剧场。
+ *    上下滑 = 整部剧切换（跟手），单击 = 暂停/播放，长按 = 恒 2.0x。
  *
- *  第二段 详情：点「观看完整短剧」→ 视频**向上收**成 16:9 居中，下方展开信息区，
- *    单击唤出控制层（顶部 ‹第N集 倍速 ⋮ / 底部 播放|进度|选集），
- *    上下滑 = 本剧切集，选集 = 手动点「选集」弹面板（1-30/31-60 分页 + 6 列）。
+ *  第二段 详情：点「观看完整短剧」或「剧名」→ 左下信息层换成底部一行
+ *    `选集 78集｜1.0x｜1080P｜⛶`，**视频位置与尺寸一像素都不动（0ms 硬切，无动画）**。
+ *    上下滑 = 本剧切集，选集 = 白底面板（1-30/31-60 分页 + 6 列），倍速/清晰度 = 贴着胶囊的弹窗，
+ *    ⛶ 是进全屏的唯一入口。
  *
  *  切集速度：PlayerEngine 双 ExoPlayer，空闲槽预载下一条（只缓冲、不解码），
  *  切换时交换两个槽的 surface，首帧几乎无等待。
@@ -90,45 +84,47 @@ public class PlayActivity extends AppCompatActivity {
     private boolean noMore;
     private boolean firstReady = true;
     private boolean fullscreen;
-    private boolean drawerOpen;
+    /** 自动连播（全屏「更多」里可关）。 */
     private boolean autoNext = true;
-    /** false = 首页 feed 全屏态；true = 详情态（视频收到 16:9 居中，下面展开信息）。 */
+    /** false = 首页 feed 全屏态；true = 详情态（视频位置尺寸不变，只换叠加层）。 */
     private boolean detail;
 
     private String quality = "";
-    private String shownSeriesId = "";
     private float speed = 1.0f;
     private boolean boosting;
+    /** 按下时被"正在换集"挡掉：随后的 MOVE / UP 一律忽略，避免拿旧坐标误判手势。 */
+    private boolean gDown;
 
     // ---------------- UI ----------------
     private FrameLayout root, stage, rail;
-    private LinearLayout bottomStack, tabBar, capBar, oTop, oBottom, drawer, epBlock;
+    private LinearLayout bottomStack, tabBar, capBar, oTop, oBottom;
     private LinearLayout oTopRow, oEpRow;
     /** 首页 feed 态叠在画面左下角的信息层（剧名/标签/第N集|简介/观看完整短剧）。 */
     private LinearLayout feedLayer;
     private TextView feedTitle, feedTag, feedEp, feedOpen;
-    private TextView status, centerHint, oCenterPlay, oSearch, oRailFav;
-    private TextView oBack, oEpTitle, oSpd, oMore, oPlay, oCur, oDur, oEpBtn, oFull, autoBtn;
+    private TextView status, centerHint, oCenterPlay, oSearch, oRailFav, epBadge;
+    private TextView oBack, oEpTitle, oSpd, oMore, oPlay, oCur, oDur, oEpBtn, oFull;
     private TextView tabHome, tabTheater;
     /** 详情态底部一行：选集 / 倍速 / 清晰度 / 全屏。 */
-    private TextView epCapsule, spdCapsule, qCapsule, fsBtn;
+    private TextView epCapsule, spdCapsule, qCapsule;
+    private View fsBtn;
     private ThinSeek thinSeek, oSeek;
-    private View scrim, gestureLayer;
-    private RecyclerView epGrid;
-    private EpAdapter epAdapter;
+    private View gestureLayer;
     private boolean seeking;
-    /** 锚定在胶囊上的选择弹窗（倍速/清晰度），同一时刻只允许一个。 */
+    /** 锚定在胶囊/顶栏按钮上的选择弹窗（倍速 / 清晰度 / 更多），同一时刻只允许一个。 */
     private PopupWindow popup;
     private View popupAnchor;
     private List<String> qDefs = new ArrayList<>();
     /** 详情态队列快照：进详情时换成该剧整剧，返回时还原 feed 队列与游标。 */
     private FeedQueue feedQueue;
     private int feedCursor = -1;
-    /** 白底选集面板（同一部剧复用，换剧重建）。 */
+    /** 白底选集面板（同一部剧复用；换剧先 destroy 再重建，否则视图会一直挂在 root 上）。 */
     private EpisodeSheet sheet;
     private String sheetDetailId = "";
 
     private final Handler ui = new Handler(Looper.getMainLooper());
+    /** 系统栏占位（透明状态栏/导航条下，叠在上面的控件要让开的像素）。 */
+    private int insetTop, insetBottom;
 
     // ---------------- 手势状态 ----------------
     private static final int G_NONE = 0, G_SEEK = 1, G_SWITCH = 2;
@@ -152,6 +148,15 @@ public class PlayActivity extends AppCompatActivity {
         String sid = getIntent().getStringExtra(E_SID);
         mode = sid == null || sid.isEmpty() ? MODE_FEED : MODE_SERIES;
         detail = mode == MODE_SERIES;      // 从剧场点进来就直接是详情态
+        // 画面要像原生一样贴满整块屏幕（含状态栏/导航条下方）。
+        // 之前 root.setFitsSystemWindows(true) 把内容塞进状态栏以下、导航条以上的区域，
+        // 页面整体下移 (~半个状态栏)，看起来就是"视频偏下"。
+        androidx.core.view.WindowCompat.setDecorFitsSystemWindows(getWindow(), false);
+        getWindow().setStatusBarColor(Color.TRANSPARENT);
+        getWindow().setNavigationBarColor(Color.TRANSPARENT);
+        androidx.core.view.WindowInsetsControllerCompat sc =
+                androidx.core.view.WindowCompat.getInsetsController(getWindow(), getWindow().getDecorView());
+        if (sc != null) sc.setAppearanceLightStatusBars(false);
         setContentView(build());
         try {
             Api.init(this);
@@ -166,6 +171,38 @@ public class PlayActivity extends AppCompatActivity {
                     getIntent().getStringExtra(E_COVER));
         }
         ui.post(tickRun);   // 进度条常显，定时器一直跑
+    }
+
+    /**
+     * 系统栏占位：画面不缩（stage 就要顶到屏幕边），只让叠在上面的控件让开。
+     * 状态栏透明、内容画到状态栏下面，和原生一致。
+     */
+    private void applyInsets() {
+        if (root == null) return;
+        FrameLayout.LayoutParams lp;
+        if (epBadge != null) {
+            lp = (FrameLayout.LayoutParams) epBadge.getLayoutParams();
+            lp.topMargin = dp(8) + insetTop;
+            epBadge.setLayoutParams(lp);
+        }
+        if (oSearch != null) {
+            lp = (FrameLayout.LayoutParams) oSearch.getLayoutParams();
+            lp.topMargin = dp(6) + insetTop;
+            oSearch.setLayoutParams(lp);
+        }
+        if (rail != null && rail.getLayoutParams() instanceof FrameLayout.LayoutParams) {
+            lp = (FrameLayout.LayoutParams) rail.getLayoutParams();
+            lp.bottomMargin = dp(96) + insetBottom;
+            rail.setLayoutParams(lp);
+        }
+        if (bottomStack != null) bottomStack.setPadding(0, 0, 0, insetBottom);
+        if (oTop != null) oTop.setPadding(0, insetTop, 0, 0);
+        if (oBottom != null) oBottom.setPadding(dp(8), dp(10), dp(10), dp(6) + insetBottom);
+        if (feedLayer != null) {
+            lp = (FrameLayout.LayoutParams) feedLayer.getLayoutParams();
+            lp.bottomMargin = dp(46 + 14 + 8) + insetBottom;
+            feedLayer.setLayoutParams(lp);
+        }
     }
 
     private int dp(float v) {
@@ -187,7 +224,17 @@ public class PlayActivity extends AppCompatActivity {
     private View build() {
         root = new FrameLayout(this);
         root.setBackgroundColor(Color.BLACK);
-        root.setFitsSystemWindows(true);
+        // 不设 fitsSystemWindows：那会把整页塞进状态栏下面，画面看着往下掉。
+        // 系统栏占位由 applyInsets() 只给叠加的控件补，视频本身顶到屏幕边。
+        androidx.core.view.ViewCompat.setOnApplyWindowInsetsListener(root, (v, ins) -> {
+            androidx.core.graphics.Insets sb = ins.getInsets(
+                    androidx.core.view.WindowInsetsCompat.Type.systemBars()
+                            | androidx.core.view.WindowInsetsCompat.Type.displayCutout());
+            insetTop = sb.top;
+            insetBottom = sb.bottom;
+            applyInsets();
+            return ins;
+        });
 
         // ---- 视频区：直接铺满 root ----
         stage = new FrameLayout(this);
@@ -220,23 +267,31 @@ public class PlayActivity extends AppCompatActivity {
         });
         stage.addView(oCenterPlay, cpLp);
 
-        // 右侧追剧
+        // 右侧追剧：竖向 icon（★ + 文字），贴在右下、按钮行上方 ——
+        // 之前放在 CENTER_VERTICAL，正好压在画面正中间（字幕位置），既挡片又不像原生。
         rail = new FrameLayout(this);
-        oRailFav = tv("\u2606", 22, Color.WHITE);
+        oRailFav = tv("\u2606", 24, Color.WHITE);
         oRailFav.setGravity(Gravity.CENTER);
-        oRailFav.setPadding(dp(8), dp(8), dp(8), dp(4));
+        rail.addView(oRailFav, new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(38)));
+        TextView railLabel = tv("追剧", 10, 0xFFEDEDF0);
+        railLabel.setGravity(Gravity.CENTER);
+        railLabel.setShadowLayer(3, 1, 1, 0x99000000);
+        FrameLayout.LayoutParams railTxtLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
+        railTxtLp.topMargin = dp(36);
+        rail.addView(railLabel, railTxtLp);
         oRailFav.setOnClickListener(v -> {
             if (curItem == null) return;
             boolean on = Store.toggleFav(this, curItem.sid, curItem.seriesTitle, curItem.cover);
             syncFav();
             toast(on ? "已追剧" : "已取消追剧");
         });
-        rail.addView(oRailFav, new FrameLayout.LayoutParams(dp(40), dp(40)));
         FrameLayout.LayoutParams railLp = new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
-                Gravity.END | Gravity.CENTER_VERTICAL);
+                dp(52), dp(58), Gravity.END | Gravity.BOTTOM);
         railLp.rightMargin = dp(6);
-        stage.addView(rail, railLp);
+        railLp.bottomMargin = dp(96);          // tabBar 46 + 进度条 14 + 余量
+        // 加进 stage 的时机放到 feed 信息层之后（见下），否则会被信息层的渐变遮暗
 
         // ---- 首页 feed 信息层：叠在画面左下（原生就是这样，压在视频上）----
         feedLayer = new LinearLayout(this);
@@ -294,6 +349,9 @@ public class PlayActivity extends AppCompatActivity {
                 ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT,
                 Gravity.BOTTOM));
 
+        // 追剧图标最后加：要压在 feed 信息层的渐变之上，否则会被那条黑色渐变遮暗
+        stage.addView(rail, railLp);
+
         // ---- 底部堆叠（自下而上：细进度条 → tabBar / capBar），都叠在视频上、不占视频高度 ----
         bottomStack = new LinearLayout(this);
         bottomStack.setOrientation(LinearLayout.VERTICAL);
@@ -324,8 +382,7 @@ public class PlayActivity extends AppCompatActivity {
         capBar.addView(capScroll, new LinearLayout.LayoutParams(0,
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
 
-        fsBtn = tv("\u26f6", 17, Color.WHITE);
-        fsBtn.setGravity(Gravity.CENTER);
+        fsBtn = new CornerIcon();
         GradientDrawable fsg = new GradientDrawable();
         fsg.setShape(GradientDrawable.OVAL);
         fsg.setColor(0x33FFFFFF);
@@ -374,6 +431,24 @@ public class PlayActivity extends AppCompatActivity {
         oSearch.setOnClickListener(v -> startActivity(new Intent(this, SearchActivity.class)));
         root.addView(oSearch, sLp);
 
+        // ---- 详情态左上角：‹ 第 N 集（常显，不随控制层隐藏）----
+        // 用户要知道自己看到第几集；原来这个信息只在全屏顶栏里，竖屏详情根本看不到。
+        epBadge = tv("", 13, Color.WHITE);
+        epBadge.setGravity(Gravity.CENTER_VERTICAL);
+        epBadge.setPadding(dp(10), dp(5), dp(12), dp(5));
+        GradientDrawable ebg = new GradientDrawable();
+        ebg.setCornerRadius(dp(14));
+        ebg.setColor(0x66000000);
+        epBadge.setBackground(ebg);
+        epBadge.setOnClickListener(v -> onBackPressed());
+        epBadge.setVisibility(View.GONE);
+        FrameLayout.LayoutParams ebLp = new FrameLayout.LayoutParams(
+                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT,
+                Gravity.TOP | Gravity.START);
+        ebLp.topMargin = dp(8);
+        ebLp.leftMargin = dp(10);
+        root.addView(epBadge, ebLp);
+
         // ---- 全屏顶栏 ----
         oTop = new LinearLayout(this);
         oTop.setOrientation(LinearLayout.VERTICAL);
@@ -392,11 +467,11 @@ public class PlayActivity extends AppCompatActivity {
                 ViewGroup.LayoutParams.WRAP_CONTENT, 1f));
         oSpd = tv("倍速", 13, TXT);
         oSpd.setPadding(dp(10), dp(4), dp(10), dp(4));
-        oSpd.setOnClickListener(v -> openDrawer());
+        oSpd.setOnClickListener(v -> showSpeedPopup(oSpd));
         oTopRow.addView(oSpd);
         oMore = tv("\u22ee", 18, TXT);
         oMore.setPadding(dp(10), dp(2), dp(10), dp(2));
-        oMore.setOnClickListener(v -> openDrawer());
+        oMore.setOnClickListener(v -> showMorePopup(oMore));
         oTopRow.addView(oMore);
         oTop.addView(oTopRow);
         oTop.setVisibility(View.GONE);
@@ -446,53 +521,9 @@ public class PlayActivity extends AppCompatActivity {
                 Gravity.BOTTOM));
 
         // ---- 抽屉 ----
-        scrim = new View(this);
-        scrim.setBackgroundColor(0x66000000);
-        scrim.setVisibility(View.GONE);
-        scrim.setOnClickListener(v -> closeDrawer());
-        root.addView(scrim, new FrameLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.MATCH_PARENT));
-
-        drawer = new LinearLayout(this);
-        drawer.setOrientation(LinearLayout.VERTICAL);
-        drawer.setBackgroundColor(0xF2121216);
-        drawer.setPadding(dp(14), dp(10), dp(14), dp(10));
-        drawer.setVisibility(View.GONE);
-
-        // 倍速 / 清晰度已经改成贴着胶囊的锚定弹窗，抽屉里只留选集与连播开关
-        autoBtn = tv("", 12, DIM);
-        autoBtn.setPadding(dp(12), dp(6), dp(12), dp(6));
-        autoBtn.setOnClickListener(v -> {
-            autoNext = !autoNext;
-            markAuto();
-            toast(autoNext ? "已开启自动连播" : "已关闭自动连播");
-        });
-        LinearLayout.LayoutParams abLp = new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.WRAP_CONTENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-        abLp.bottomMargin = dp(6);
-        drawer.addView(autoBtn, abLp);
-
-        epBlock = new LinearLayout(this);
-        epBlock.setOrientation(LinearLayout.VERTICAL);
-        epBlock.addView(label("选集"));
-        epGrid = new RecyclerView(this);
-        GridLayoutManager glm = new GridLayoutManager(this, 6);
-        glm.setSpanSizeLookup(new GridLayoutManager.SpanSizeLookup() {
-            @Override
-            public int getSpanSize(int position) {
-                return epAdapter != null && epAdapter.isHeader(position) ? 6 : 1;
-            }
-        });
-        epGrid.setLayoutManager(glm);
-        epGrid.setPadding(0, dp(6), 0, dp(6));
-        epAdapter = new EpAdapter();
-        epGrid.setAdapter(epAdapter);
-        epBlock.addView(epGrid, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
-        drawer.addView(epBlock, new LinearLayout.LayoutParams(
-                ViewGroup.LayoutParams.MATCH_PARENT, 0, 1f));
-
-        root.addView(drawer, drawerLp(false));
+        // 原来的底部抽屉（选集网格 + 连播）已删除：选集统一走白底面板，
+        // 倍速/清晰度/连播统一走贴着按钮的弹窗。全屏顶栏的「倍速」「⋮」也接弹窗，
+        // 之前它们打开的是抽屉 —— 抽屉里根本没有倍速，属于按钮与功能对不上。
 
         centerHint = tv("", 14, Color.WHITE);
         centerHint.setGravity(Gravity.CENTER);
@@ -516,7 +547,6 @@ public class PlayActivity extends AppCompatActivity {
                 Gravity.CENTER));
 
         applyOrientation();
-        markAuto();
         return root;
     }
 
@@ -542,26 +572,6 @@ public class PlayActivity extends AppCompatActivity {
         return t;
     }
 
-    private TextView label(String s) {
-        TextView t = new TextView(this);
-        t.setText(s);
-        t.setTextSize(12);
-        t.setTextColor(DIM);
-        t.setPadding(0, dp(2), 0, 0);
-        return t;
-    }
-
-    private FrameLayout.LayoutParams drawerLp(boolean fs) {
-        int w = getResources().getDisplayMetrics().widthPixels;
-        int h = getResources().getDisplayMetrics().heightPixels;
-        if (fs) {
-            int dw = Math.max(dp(260), w / 3);
-            return new FrameLayout.LayoutParams(dw,
-                    ViewGroup.LayoutParams.MATCH_PARENT, Gravity.END);
-        }
-        return new FrameLayout.LayoutParams(w, (int) (h * 0.55f), Gravity.BOTTOM);
-    }
-
     /**
      * 三态（feed / 详情 / 横屏全屏）**只切叠加层可见性**。
      * stage 永远是 MATCH_PARENT，这里绝不改它的 LayoutParams ——
@@ -579,9 +589,9 @@ public class PlayActivity extends AppCompatActivity {
         }
 
         feedLayer.setVisibility(feedUi ? View.VISIBLE : View.GONE);
-        // 底部栏叠在画面上，feed 的信息层要让开（tabBar 46 + 进度条 14 + 余量 8）
+        // 底部栏叠在画面上，feed 的信息层要让开（tabBar 46 + 进度条 14 + 余量 8 + 导航条）
         FrameLayout.LayoutParams flp = (FrameLayout.LayoutParams) feedLayer.getLayoutParams();
-        flp.bottomMargin = dp(46 + 14 + 8);
+        flp.bottomMargin = dp(46 + 14 + 8) + insetBottom;
         feedLayer.setLayoutParams(flp);
 
         bottomStack.setVisibility(fullscreen ? View.GONE : View.VISIBLE);
@@ -589,17 +599,35 @@ public class PlayActivity extends AppCompatActivity {
         capBar.setVisibility(!fullscreen && dt ? View.VISIBLE : View.GONE);
         thinSeek.setVisibility(fullscreen ? View.GONE : View.VISIBLE);
         oSearch.setVisibility(fullscreen ? View.GONE : View.VISIBLE);
+        // 详情态常显「‹ 第 N 集」；feed 态和全屏不显示（全屏顶栏自己有）
+        if (epBadge != null) epBadge.setVisibility(dt && !fullscreen ? View.VISIBLE : View.GONE);
         rail.setVisibility(fullscreen ? View.GONE : View.VISIBLE);
         oTop.setVisibility(fullscreen ? View.VISIBLE : View.GONE);
         oBottom.setVisibility(fullscreen ? View.VISIBLE : View.GONE);
         oSpd.setVisibility(fullscreen ? View.VISIBLE : View.GONE);
         oMore.setVisibility(fullscreen ? View.VISIBLE : View.GONE);
         if (!fullscreen) oCenterPlay.setVisibility(View.GONE);
-        drawer.setLayoutParams(drawerLp(fullscreen));
-        if (epGrid != null && epGrid.getLayoutManager() instanceof GridLayoutManager) {
-            ((GridLayoutManager) epGrid.getLayoutManager()).setSpanCount(6);
-        }
+        applyInsets();          // 系统栏占位（状态栏/导航条）随状态重算
+        applyResizeMode();      // 竖屏铺满（zoom）/ 横屏完整显示（fit）
         updateCapsules();
+    }
+
+    /**
+     * 竖屏播放铺满整屏（center-crop，原生就是这个效果）；
+     * 横屏全屏要看到完整画面，所以用 fit。
+     * 片源本身是横的、屏幕是竖的时，zoom 会把画面裁成一条，这种仍然用 fit。
+     */
+    private void applyResizeMode() {
+        if (engine == null) return;
+        boolean portraitSrc = engine.videoHeight() <= 0
+                || engine.videoHeight() >= engine.videoWidth();
+        int rm = (!fullscreen && portraitSrc)
+                ? androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+                : androidx.media3.ui.AspectRatioFrameLayout.RESIZE_MODE_FIT;
+        for (int i = 0; i < 2; i++) {
+            androidx.media3.ui.PlayerView v = engine.view(i);
+            if (v != null) v.setResizeMode(rm);
+        }
     }
 
     /**
@@ -641,7 +669,6 @@ public class PlayActivity extends AppCompatActivity {
         if (!q.seekEp(cur.epIndex())) q.seekVid(cur.vid());
         queue = q;
         curItem = q.current();
-        epAdapter.set(q.curDetail());
         // 空闲槽里预载的是"下一部剧"，语境已变，作废重来
         slotToken[1 - activeSlot]++;
         engine.releaseSlot(1 - activeSlot);
@@ -649,11 +676,20 @@ public class PlayActivity extends AppCompatActivity {
         updateUi();
     }
 
+    /**
+     * 详情 → feed：队列还原成推荐队列。
+     * 游标不能只用快照：在详情里可能已经切了好几集，快照停在进详情时那一集，
+     * 直接 cursor(feedCursor) 会让"画面在播第 5 集、队列说第 1 集"（保存进度、下次续播全错）。
+     * 所以优先按当前 vid 找回同一条，找不到才退回快照位置。
+     */
     private void restoreFeedQueue() {
         if (feedQueue == null) return;
+        String vid = curItem == null ? null : curItem.vid();
         queue = feedQueue;
         feedQueue = null;
-        if (feedCursor >= 0) queue.cursor(feedCursor);
+        if (vid == null || vid.isEmpty() || !queue.seekVid(vid)) {
+            if (feedCursor >= 0) queue.cursor(feedCursor);
+        }
         feedCursor = -1;
         curItem = queue.current();
         slotToken[1 - activeSlot]++;
@@ -708,7 +744,12 @@ public class PlayActivity extends AppCompatActivity {
             return;
         }
         curItem = it;
-        epAdapter.set(queue.curDetail());
+        // 重开当前槽属于"重新开始"：把还在路上的换集/超时状态清干净，
+        // 否则 switching 残留会让 preloadNext() 一直不动。
+        switching = false;
+        pendingSwapSlot = -1;
+        pendingPrevCursor = -1;
+        swapSeq++;
         updateUi();
         // 另一槽可能是同一条的预载（切清晰度会撞同一个缓存文件），先放掉再重开
         engine.releaseSlot(1 - activeSlot);
@@ -745,10 +786,14 @@ public class PlayActivity extends AppCompatActivity {
                 String key = (String) v[1];
                 @SuppressWarnings("unchecked")
                 List<Model.Track> ts = (List<Model.Track>) v[2];
-                lastTracks = ts;
-                quality = t.definition;
-                buildQualityList();
-                updateCapsules();
+                // 只有"在台上"的那一槽才更新清晰度口径；预载槽只是后台缓冲，
+                // 拿它的 definition 覆盖全局会让胶囊标签跟着预载跳动。
+                if (!preload || slot == activeSlot) {
+                    lastTracks = ts;
+                    quality = t.definition;
+                    buildQualityList();
+                    updateCapsules();
+                }
                 String tag = it.vid() + "." + safe(t.definition);
                 File plain = new File(getCacheDir(), tag + ".mp4");
                 File enc = new File(getCacheDir(), tag + ".enc");
@@ -773,13 +818,7 @@ public class PlayActivity extends AppCompatActivity {
                 }
                 // 换集失败：把游标退回原处，别停在一个打不开的条目上
                 if (pendingSwapSlot == slot) {
-                    pendingSwapSlot = -1;
-                    switching = false;
-                    swapSeq++;
-                    if (queue != null && pendingPrevCursor >= 0) queue.cursor(pendingPrevCursor);
-                    pendingPrevCursor = -1;
-                    curItem = queue == null ? null : queue.current();
-                    updateUi();
+                    cancelSwap();
                 }
                 toast("这条打不开：" + msg(e));
             }
@@ -788,10 +827,6 @@ public class PlayActivity extends AppCompatActivity {
 
     private void updateUi() {
         if (curItem == null) return;
-        if (!curItem.sid.equals(shownSeriesId)) {
-            shownSeriesId = curItem.sid;
-            epAdapter.set(queue == null ? null : queue.curDetail());
-        }
 
         // 首页 feed 的左下信息层（原生样式：剧名 / 标签 / 第N集|简介 / 观看完整短剧）
         if (feedTitle != null) {
@@ -803,12 +838,12 @@ public class PlayActivity extends AppCompatActivity {
         }
         oEpTitle.setText("第 " + curItem.epIndex() + " 集");
         oEpBtn.setText("选集 · 全 " + curItem.epCnt + " 集");
-        epAdapter.highlight(curItem.epIndex());
+        if (epBadge != null) epBadge.setText("\u2039 第 " + curItem.epIndex() + " 集");
         updateCapsules();
         if (sheet != null && sheet.isOpen()) sheet.setCurrent(curItem.epIndex());
         syncFav();
-        Store.recordHist(this, curItem.sid, curItem.seriesTitle, curItem.cover,
-                curItem.epIndex(), curItem.epCnt, 0);
+        // 观看记录不在这里写：这里每次切集都会跑一遍，写 0 秒会把续播点清掉。
+        // 统一由 saveProgress() 写真实进度（切集后 / onPause 各一次）。
     }
 
     /** 底部三枚胶囊：选集 N集 ｜ 1.0x ｜ 1080P（长按加速时倍速胶囊临时变 2.0x 并转橙）。 */
@@ -819,10 +854,6 @@ public class PlayActivity extends AppCompatActivity {
         spdCapsule.setText(fmtSpeed(boosting ? LONG_PRESS_SPEED : speed));
         spdCapsule.setTextColor(boosting ? PINK : TXT);
         qCapsule.setText(quality == null || quality.isEmpty() ? "清晰度" : quality.toUpperCase());
-    }
-
-    private boolean isFullSeries() {
-        return queue != null && !queue.isFeed();
     }
 
     private void syncFav() {
@@ -861,12 +892,9 @@ public class PlayActivity extends AppCompatActivity {
         PlayerEngine.Slot s = engine.slot(idle);
         engine.throttle(activeSlot);
         if (s.item != null && s.item.sameAs(target)) {
-            if (s.ready) {
-                doSwap(dir);
-                return;
-            }
+            // 预载到了这一条：READY 就直接上台，没 READY 也先上台自己接缓冲，别干等
             doSwap(dir);
-            armStallHint(idle);
+            if (!s.ready) armStallHint(idle);
             return;
         }
         setStatus("正在打开…");
@@ -926,14 +954,10 @@ public class PlayActivity extends AppCompatActivity {
         PlayerEngine.Slot s = engine.slot(idle);
         engine.throttle(activeSlot);   // 还在播的这一条限速，别跟预载抢带宽
         if (s.item != null && s.item.sameAs(target)) {
-            if (s.ready) {
-                doSwap(dir);
-                return;
-            }
             // 预载到了这一条但还没 READY：别干等，先上台让 ExoPlayer 自己接缓冲。
             // 之前这里是"挂 5 秒超时什么都不做"，于是每次切集都像死了 5 秒。
             doSwap(dir);
-            armStallHint(idle);
+            if (!s.ready) armStallHint(idle);
             return;
         }
         setStatus("正在打开…");
@@ -942,15 +966,39 @@ public class PlayActivity extends AppCompatActivity {
         openInto(idle, target, 0, false, null);
     }
 
-    /** 没预载过的条目：等它 READY 再交换；4 秒还没好就强制换，别把界面锁死。 */
+    /**
+     * 没预载过的条目：4 秒还没好就别死等。
+     * 但如果连流都还没建起来（item/player 为空），强制切过去只会切到一个黑槽，
+     * 这种情况原地退回、提示重试，比黑屏好。
+     */
     private void armSwapTimeout() {
         final int slot = pendingSwapSlot;
         final int token = ++swapSeq;
         ui.postDelayed(() -> {
             if (token != swapSeq || pendingSwapSlot != slot || pendingSwapSlot < 0) return;
+            PlayerEngine.Slot s = engine.slot(slot);
+            if (s.item == null || s.player == null) {
+                cancelSwap();
+                setStatus("加载失败，请再试一次");
+                return;
+            }
             setStatus("加载有点慢…");
             doSwap(pendingDir);
         }, 4000);
+    }
+
+    /** 换集失败/超时：游标退回原处，界面回到原来那一集，别停在打不开的条目上。 */
+    private void cancelSwap() {
+        pendingSwapSlot = -1;
+        switching = false;
+        swapSeq++;
+        if (queue != null && pendingPrevCursor >= 0) queue.cursor(pendingPrevCursor);
+        pendingPrevCursor = -1;
+        curItem = queue == null ? null : queue.current();
+        updateUi();
+        // throttle() 可能已经把正在播的这一条限速到 "已下 + 4MB"，退回时必须放开，
+        // 否则它播几秒就会卡住不动。
+        engine.activate(activeSlot, boosting ? LONG_PRESS_SPEED : speed);
     }
 
     /** 已经上台但还没出画：800ms 后才提示，不再拿"等 5 秒"当常态。 */
@@ -975,8 +1023,11 @@ public class PlayActivity extends AppCompatActivity {
         ov.animate().cancel();
         nv.setTranslationY(dir > 0 ? h : -h);
         nv.setVisibility(View.VISIBLE);
-        engine.activate(newSlot, boosting ? LONG_PRESS_SPEED : speed);
         activeSlot = newSlot;
+        // 先让旧槽停声：两个 ExoPlayer 会重叠 200ms（滑动动画期间），
+        // 不停就是两条音轨同时出，听起来像回声。画面交给动画滑出去。
+        engine.deactivate(oldSlot);
+        engine.activate(newSlot, boosting ? LONG_PRESS_SPEED : speed);
 
         nv.animate().translationY(0).setDuration(200).start();
         final int park = h;
@@ -987,8 +1038,10 @@ public class PlayActivity extends AppCompatActivity {
                 }).start();
 
         switching = false;
+        pendingPrevCursor = -1;
         curItem = queue == null ? null : queue.current();
         updateUi();
+        saveProgress();                       // 换集即落盘（新集从 0 开始）
         status.setVisibility(View.GONE);
         ui.postDelayed(() -> {
             if (oldSlot == activeSlot) return;   // 又切回来了，别把正在播的释放掉
@@ -1004,13 +1057,19 @@ public class PlayActivity extends AppCompatActivity {
         stage.animate().translationY(0).setDuration(160).start();
     }
 
-    /** 空闲槽预载下一条（只缓冲、不出声、不解码）。 */
+    /**
+     * 空闲槽预载"用户下一手最可能看的那一条"（只缓冲、不出声、不解码）。
+     *
+     * 关键：预载目标必须和手势动作一致，否则预了也用不上 ——
+     *   feed 里上下滑 = 换整部剧，所以要预"下一部剧的第 1 集"；
+     *   详情/全屏里上下滑 = 换本剧的下一集，所以要预"下一集"。
+     * 之前三态统一预 "peekNext"（feed 里等于本剧下一集），于是每次在 feed 上滑
+     * 都是冷启动 —— 这就是"多播放器好像没用、切换还是要等下载"的直接原因。
+     */
     private void preloadNext() {
         if (queue == null || switching) return;
         if (!engine.preloadEnabled()) return;      // 低内存机：不预载，省内存
-        // 三态统一预载「下一条」：feed 里是同一部的下一集（播完自动连播走 switchBy），
-        // 详情/全屏也是下一集。feed 上滑切整部剧走 openInto，不指望命中预载。
-        FeedQueue.Item next = queue.peekNext();
+        FeedQueue.Item next = queue.isFeed() ? queue.peekNextSeries() : queue.peekNext();
         if (next == null) {
             if (queue.isFeed() && queue.needExtend(2)) extendSilently();
             return;
@@ -1073,31 +1132,6 @@ public class PlayActivity extends AppCompatActivity {
     }
 
     // ================= 控制层 =================
-    /**
-     * 顶部「‹ 第N集」+ 中央播放键的显隐。底部按钮行（capBar）/ tab / 进度条**常显**，
-     * 不参与显隐，所以这里不碰它们。
-     */
-    private void toggleControls() {
-        if (sheetOpen()) {
-            sheet.collapse();
-            return;
-        }
-        if (drawerOpen) {
-            closeDrawer();
-            return;
-        }
-        if (popup != null) {
-            dismissPopup();
-            return;
-        }
-        boolean show = oTop.getVisibility() != View.VISIBLE;
-        oTop.setVisibility(show ? View.VISIBLE : View.GONE);
-        if (fullscreen) oBottom.setVisibility(show ? View.VISIBLE : View.GONE);
-        oCenterPlay.setVisibility(show && !isPlayingNow() ? View.VISIBLE : View.GONE);
-        if (show) scheduleHide();
-        else ui.removeCallbacks(hideRun);
-    }
-
     /** 暂停 / 首次就绪时亮一下顶部与中央播放键。 */
     private void showControls() {
         if (fullscreen || detail) oTop.setVisibility(View.VISIBLE);
@@ -1113,7 +1147,7 @@ public class PlayActivity extends AppCompatActivity {
 
     private final Runnable hideRun = () -> {
         if (!isPlayingNow()) return;
-        if (drawerOpen || popup != null || sheetOpen()) return;
+        if (popup != null || sheetOpen()) return;
         oCenterPlay.setVisibility(View.GONE);
         oTop.setVisibility(View.GONE);
         if (fullscreen) oBottom.setVisibility(View.GONE);
@@ -1121,7 +1155,7 @@ public class PlayActivity extends AppCompatActivity {
 
     private void scheduleHide() {
         ui.removeCallbacks(hideRun);
-        if (isPlayingNow() && !drawerOpen && popup == null && !sheetOpen()) {
+        if (isPlayingNow() && popup == null && !sheetOpen()) {
             ui.postDelayed(hideRun, 2500);
         }
     }
@@ -1145,25 +1179,34 @@ public class PlayActivity extends AppCompatActivity {
         }
     }
 
+    /**
+     * 进度条刷新。**只在这里排下一次**：以前 tick() 自己末尾 postDelayed，
+     * 而 onSlotReady 又直接调 tick()，每换一集就多出一条永久的 500ms 循环链，
+     * 播十几集后就有十几条链同时刷 UI。
+     */
+    private final Runnable tickRun = new Runnable() {
+        @Override
+        public void run() {
+            tick();
+            ui.postDelayed(this, 500);
+        }
+    };
+
     private void tick() {
         PlayerEngine.Slot s = engine.slot(activeSlot);
-        if (s.player != null) {
-            long dur = s.player.getDuration();
-            long pos = s.player.getCurrentPosition();
-            if (dur > 0) {
-                oDur.setText(fmtMs(dur));
-                if (!seeking) {
-                    thinSeek.setProgress(pos / (float) dur);
-                    oSeek.setProgress(pos / (float) dur);
-                }
+        if (s.player == null) return;
+        long dur = s.player.getDuration();
+        long pos = s.player.getCurrentPosition();
+        if (dur > 0) {
+            oDur.setText(fmtMs(dur));
+            if (!seeking) {
+                thinSeek.setProgress(pos / (float) dur);
+                oSeek.setProgress(pos / (float) dur);
             }
-            if (!seeking) oCur.setText(fmtMs(pos));
-            oPlay.setText(s.player.isPlaying() ? "\u275a\u275a" : "\u25b6");
         }
-        ui.postDelayed(tickRun, 500);
+        if (!seeking) oCur.setText(fmtMs(pos));
+        oPlay.setText(s.player.isPlaying() ? "\u275a\u275a" : "\u25b6");
     }
-
-    private final Runnable tickRun = this::tick;
 
     private long curPos() {
         PlayerEngine.Slot s = engine.slot(activeSlot);
@@ -1229,7 +1272,7 @@ public class PlayActivity extends AppCompatActivity {
     // ================= 手势 =================
     /** 长按 450ms：临时 2.0x（恒定，和手动档位无关）。 */
     private final Runnable longPressRun = () -> {
-        if (gMode != G_NONE || drawerOpen || popup != null || sheetOpen()) return;
+        if (gMode != G_NONE || popup != null || sheetOpen()) return;
         PlayerEngine.Slot s = engine.slot(activeSlot);
         if (s.player == null || !s.player.isPlaying()) return;
         longFired = true;
@@ -1252,7 +1295,16 @@ public class PlayActivity extends AppCompatActivity {
     private boolean onGesture(MotionEvent ev) {
         switch (ev.getActionMasked()) {
             case MotionEvent.ACTION_DOWN:
-                if (switching) return true;   // 正在换集，别叠加手势
+                // 正在换集 / 面板开着：这次手势整段作废（gDown=false 会挡掉后续 MOVE/UP）。
+                // 只 return 不置位的话，MOVE 仍会拿上一次的 gDownX 算出巨大的位移，误判成快进。
+                if (switching || sheetOpen() || popup != null) {
+                    gDown = false;
+                    gMode = G_NONE;
+                    longFired = false;
+                    ui.removeCallbacks(longPressRun);
+                    return true;
+                }
+                gDown = true;
                 gDownX = ev.getX();
                 gDownY = ev.getY();
                 gDy = 0;
@@ -1263,6 +1315,7 @@ public class PlayActivity extends AppCompatActivity {
                 ui.postDelayed(longPressRun, 450);
                 return true;
             case MotionEvent.ACTION_MOVE: {
+                if (!gDown) return true;
                 float dx = ev.getX() - gDownX;
                 float dy = ev.getY() - gDownY;
                 gDy = dy;
@@ -1294,6 +1347,9 @@ public class PlayActivity extends AppCompatActivity {
             case MotionEvent.ACTION_UP:
             case MotionEvent.ACTION_CANCEL: {
                 ui.removeCallbacks(longPressRun);
+                boolean wasDown = gDown;
+                gDown = false;
+                if (!wasDown) return true;      // 这次手势从按下就被挡掉了，抬指也不做任何事
                 if (longFired) {
                     // 长按抬指只结束加速，**不能**再判成一次单击（否则松手就暂停）
                     longFired = false;
@@ -1347,6 +1403,9 @@ public class PlayActivity extends AppCompatActivity {
             return;
         }
         if (sheet == null || !d.seriesId.equals(sheetDetailId)) {
+            // 换了一部剧：旧面板的 scrim/panel 还挂在 root 上，必须先摘掉再建新的，
+            // 否则每换一部剧就多两层看不见的视图。
+            if (sheet != null) sheet.destroy();
             sheet = new EpisodeSheet(this, root, d, curItem.epIndex());
             sheet.setCb(this::jumpToEp);
             sheetDetailId = d.seriesId;
@@ -1359,7 +1418,7 @@ public class PlayActivity extends AppCompatActivity {
 
     /** 选了某一集：立即切过去（命中预载就秒切），面板自己回落。 */
     private void jumpToEp(int epIndex) {
-        if (queue == null) return;
+        if (queue == null || switching) return;
         if (curItem != null && curItem.epIndex() == epIndex) return;
         int from = curItem == null ? epIndex : curItem.epIndex();
         if (!queue.seekEp(epIndex)) return;
@@ -1375,24 +1434,6 @@ public class PlayActivity extends AppCompatActivity {
             return;
         }
         startCurrent(0);                            // 没预载：重开当前槽
-    }
-
-    // ================= 抽屉（只剩选集）=================
-    private void openDrawer() {
-        dismissPopup();
-        drawerOpen = true;
-        ui.removeCallbacks(hideRun);
-        epBlock.setVisibility(View.VISIBLE);
-        scrim.setVisibility(View.VISIBLE);
-        drawer.setVisibility(View.VISIBLE);
-        markAuto();
-        if (curItem != null) scrollToEp(curItem.epIndex());
-    }
-
-    private void closeDrawer() {
-        drawerOpen = false;
-        if (drawer != null) drawer.setVisibility(View.GONE);
-        if (scrim != null) scrim.setVisibility(View.GONE);
     }
 
     // ================= 贴着胶囊弹出的选择窗 =================
@@ -1523,24 +1564,48 @@ public class PlayActivity extends AppCompatActivity {
 
     private List<Model.Track> lastTracks = new ArrayList<>();
 
-    private void markAuto() {
-        if (autoBtn == null) return;
-        autoBtn.setText(autoNext ? "连播 开" : "连播 关");
-        autoBtn.setTextColor(autoNext ? PINK : DIM);
-        GradientDrawable g = new GradientDrawable();
-        g.setCornerRadius(dp(12));
-        g.setColor(autoNext ? 0x33FF2C55 : 0x22FFFFFF);
-        autoBtn.setBackground(g);
-    }
-
-    private void scrollToEp(int epIndex) {
-        if (epGrid == null) return;
-        epGrid.post(() -> {
-            int p = epAdapter.positionOf(epIndex);
-            if (p >= 0 && epGrid.getLayoutManager() != null) {
-                epGrid.getLayoutManager().scrollToPosition(p);
-            }
+    /**
+     * 全屏顶栏「⋮」的更多弹窗：自动连播开关 + 清晰度档位。
+     * （原来这里打开的是底部抽屉，而抽屉里既没有倍速也没有清晰度，按钮和功能对不上。）
+     */
+    private void showMorePopup(View anchor) {
+        if (popupAnchor == anchor) {
+            dismissPopup();
+            return;
+        }
+        dismissPopup();
+        if (qDefs.isEmpty()) buildQualityList();
+        LinearLayout box = popupBox();
+        TextView auto = popupRow(autoNext ? "连播：开" : "连播：关", autoNext);
+        auto.setOnClickListener(v -> {
+            autoNext = !autoNext;
+            auto.setText(autoNext ? "连播：开" : "连播：关");
+            auto.setTextColor(autoNext ? 0xFFFF7A2F : TXT);
+            toast(autoNext ? "已开启自动连播" : "已关闭自动连播");
         });
+        box.addView(auto, new LinearLayout.LayoutParams(
+                ViewGroup.LayoutParams.MATCH_PARENT, dp(34)));
+        if (!qDefs.isEmpty()) {
+            TextView head = tv("清晰度", 11, DIM);
+            head.setGravity(Gravity.CENTER);
+            box.addView(head, new LinearLayout.LayoutParams(
+                    ViewGroup.LayoutParams.MATCH_PARENT, dp(26)));
+            for (final String def : qDefs) {
+                boolean on = quality.equals(def);
+                TextView row = popupRow(def.isEmpty() ? "默认" : def.toUpperCase(), on);
+                row.setOnClickListener(v -> {
+                    int posSec = (int) (curPos() / 1000);
+                    quality = def;
+                    updateCapsules();
+                    dismissPopup();
+                    curItem = queue == null ? null : queue.current();
+                    startCurrent(posSec);      // 保留进度，重新取这一档的流
+                });
+                box.addView(row, new LinearLayout.LayoutParams(
+                        ViewGroup.LayoutParams.MATCH_PARENT, dp(34)));
+            }
+        }
+        showAnchored(anchor, box, 120, (qDefs.isEmpty() ? 1 : qDefs.size() + 2) * 34 + 16);
     }
 
     // ================= 全屏 / 剧场 =================
@@ -1573,7 +1638,7 @@ public class PlayActivity extends AppCompatActivity {
     }
 
     @Override
-    public void onConfigurationChanged(@NonNull android.content.res.Configuration cfg) {
+    public void onConfigurationChanged(android.content.res.Configuration cfg) {
         super.onConfigurationChanged(cfg);
         ui.post(this::applyOrientation);
     }
@@ -1586,10 +1651,6 @@ public class PlayActivity extends AppCompatActivity {
         }
         if (popup != null) {
             dismissPopup();
-            return;
-        }
-        if (drawerOpen) {
-            closeDrawer();
             return;
         }
         if (fullscreen) {
@@ -1663,6 +1724,11 @@ public class PlayActivity extends AppCompatActivity {
                 if (status.getVisibility() == View.VISIBLE) status.setText(s);
             });
         }
+
+        @Override
+        public void onVideoSize(int w, int h) {
+            applyResizeMode();     // 拿到真实画面比例后重算 zoom / fit
+        }
     }
 
     /** 流式播不了（不支持 Range / moov 在尾部）时：整集下载 + 解密，再按明文播。 */
@@ -1726,6 +1792,8 @@ public class PlayActivity extends AppCompatActivity {
     protected void onStop() {
         super.onStop();
         if (isChangingConfigurations() || engine == null) return;
+        dismissPopup();                 // 弹窗是独立窗口，页面走了不收会挂空
+        if (sheetOpen()) sheet.collapse();
         resumeSec = (int) (curPos() / 1000L);
         needReload = true;
         switching = false;
@@ -1775,6 +1843,38 @@ public class PlayActivity extends AppCompatActivity {
     }
 
     // ================= 细进度条 =================
+    /** ⛶ 全屏图标：自己画四条拐角线，避免某些机型字体缺字形显示成一个方框。 */
+    private class CornerIcon extends View {
+        private final Paint p = new Paint(Paint.ANTI_ALIAS_FLAG);
+
+        CornerIcon() {
+            super(PlayActivity.this);
+            p.setColor(Color.WHITE);
+            p.setStyle(Paint.Style.STROKE);
+            p.setStrokeCap(Paint.Cap.ROUND);
+            p.setStrokeWidth(dp(1.6f));
+        }
+
+        @Override
+        protected void onDraw(Canvas c) {
+            float w = getWidth();
+            float h = getHeight();
+            float l = w * 0.30f;
+            float t = h * 0.30f;
+            float r = w - l;
+            float b = h - t;
+            float seg = Math.min(w, h) * 0.16f;
+            c.drawLine(l, t, l + seg, t, p);
+            c.drawLine(l, t, l, t + seg, p);
+            c.drawLine(r - seg, t, r, t, p);
+            c.drawLine(r, t, r, t + seg, p);
+            c.drawLine(l, b - seg, l, b, p);
+            c.drawLine(l, b, l + seg, b, p);
+            c.drawLine(r - seg, b, r, b, p);
+            c.drawLine(r, b - seg, r, b, p);
+        }
+    }
+
     private class ThinSeek extends View {
         private float frac;
         private boolean drag;
@@ -1828,7 +1928,6 @@ public class PlayActivity extends AppCompatActivity {
                     invalidate();
                     long dur = curDur();
                     if (dur > 0) oCur.setText(fmtMs((long) (dur * frac)));
-                    if (e.getActionMasked() == MotionEvent.ACTION_DOWN) return true;
                     return true;
                 case MotionEvent.ACTION_UP:
                 case MotionEvent.ACTION_CANCEL:
@@ -1838,128 +1937,6 @@ public class PlayActivity extends AppCompatActivity {
                     return true;
             }
             return true;
-        }
-    }
-
-    // ================= 选集 =================
-    private class EpAdapter extends RecyclerView.Adapter<RecyclerView.ViewHolder> {
-        private final List<Object> rows = new ArrayList<>();
-        private static final int T_HEAD = 0, T_EP = 1;
-
-        void set(Model.Detail d) {
-            rows.clear();
-            if (d != null) {
-                int last = -1;
-                for (Model.Episode e : d.eps) {
-                    int group = (e.index - 1) / 30;
-                    if (group != last) {
-                        rows.add((group * 30 + 1) + "-" + (group * 30 + 30));
-                        last = group;
-                    }
-                    rows.add(e);
-                }
-            }
-            notifyDataSetChanged();
-        }
-
-        void highlight(int idx) {
-            notifyDataSetChanged();
-        }
-
-        int positionOf(int epIndex) {
-            for (int i = 0; i < rows.size(); i++) {
-                Object o = rows.get(i);
-                if (o instanceof Model.Episode && ((Model.Episode) o).index == epIndex) return i;
-            }
-            return -1;
-        }
-
-        boolean isHeader(int pos) {
-            return pos >= 0 && pos < rows.size() && rows.get(pos) instanceof String;
-        }
-
-        @Override
-        public int getItemViewType(int position) {
-            return rows.get(position) instanceof String ? T_HEAD : T_EP;
-        }
-
-        @NonNull
-        @Override
-        public RecyclerView.ViewHolder onCreateViewHolder(@NonNull ViewGroup parent, int viewType) {
-            TextView t = new TextView(PlayActivity.this);
-            if (viewType == T_HEAD) {
-                t.setTextSize(11);
-                t.setTextColor(DIM);
-                t.setPadding(dp(2), dp(10), dp(2), dp(4));
-                return new HeadHolder(t);
-            }
-            t.setGravity(Gravity.CENTER);
-            t.setTextSize(13);
-            t.setPadding(0, dp(8), 0, dp(8));
-            RecyclerView.LayoutParams lp = new RecyclerView.LayoutParams(
-                    ViewGroup.LayoutParams.MATCH_PARENT, ViewGroup.LayoutParams.WRAP_CONTENT);
-            lp.setMargins(dp(2), dp(2), dp(2), dp(2));
-            t.setLayoutParams(lp);
-            return new EpHolder(t);
-        }
-
-        @Override
-        public void onBindViewHolder(@NonNull RecyclerView.ViewHolder holder, int pos) {
-            if (holder instanceof HeadHolder) {
-                ((HeadHolder) holder).t.setText(String.valueOf(rows.get(pos)));
-                return;
-            }
-            Model.Episode e = (Model.Episode) rows.get(pos);
-            TextView t = ((EpHolder) holder).t;
-            t.setText(String.valueOf(e.index));
-            boolean on = curItem != null && e.index == curItem.epIndex();
-            t.setTextColor(on ? Color.WHITE : 0xFFBBBBBB);
-            GradientDrawable g = new GradientDrawable();
-            g.setCornerRadius(dp(6));
-            g.setColor(on ? PINK : 0x22FFFFFF);
-            t.setBackground(g);
-            t.setOnClickListener(v -> {
-                if (queue == null) return;
-                int dir = e.index - (curItem == null ? 0 : curItem.epIndex());
-                if (dir == 0) {
-                    closeDrawer();
-                    return;
-                }
-                if (queue.seekEp(e.index)) {
-                    closeDrawer();
-                    switching = true;
-                    pendingDir = dir > 0 ? 1 : -1;
-                    pendingSwapSlot = 1 - activeSlot;
-                    curItem = queue.current();
-                    updateUi();
-                    setStatus("正在打开…");
-                    armSwapTimeout();
-                    openInto(pendingSwapSlot, curItem, 0, false, null);
-                }
-            });
-        }
-
-        @Override
-        public int getItemCount() {
-            return rows.size();
-        }
-    }
-
-    private static class EpHolder extends RecyclerView.ViewHolder {
-        final TextView t;
-
-        EpHolder(TextView t) {
-            super(t);
-            this.t = t;
-        }
-    }
-
-    private static class HeadHolder extends RecyclerView.ViewHolder {
-        final TextView t;
-
-        HeadHolder(TextView t) {
-            super(t);
-            this.t = t;
         }
     }
 }

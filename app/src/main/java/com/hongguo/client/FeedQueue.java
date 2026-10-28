@@ -84,7 +84,7 @@ final class FeedQueue {
         return i >= 0 && i < items.size() ? items.get(i) : null;
     }
 
-    /** 下一部剧的第一集（feed 预载用；没有则 null）。 */
+    /** 下一部剧的第一集（feed 竖滑切整部剧，预载就预这一条）。 */
     Item peekNextSeries() {
         Item cur = current();
         if (cur == null) return null;
@@ -109,11 +109,6 @@ final class FeedQueue {
         cursor = i;
         trim();
         return true;
-    }
-
-    /** 后面还有没有（同剧的下一集 or 下一部剧）。 */
-    boolean hasNext() {
-        return peekNext() != null || feed;
     }
 
     /** 当前这部剧的第一集在列表里的位置（没有则 -1）。 */

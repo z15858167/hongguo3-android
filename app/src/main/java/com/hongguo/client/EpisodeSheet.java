@@ -98,6 +98,14 @@ final class EpisodeSheet {
         }
         if (panel == null) build();
         open = true;
+        // 面板是按"打开那一刻的当前集"算页签的：中途切过集（尤其跨页）再打开，
+        // 页签还停在上一次的页码，当前集就不在可见页里了。
+        int want = pageOf(curEp);
+        if (want != page) {
+            page = want;
+            markPages();
+            adapter.submit(itemsOfPage());
+        }
         scrim.setVisibility(View.VISIBLE);
         panel.setVisibility(View.VISIBLE);
         panel.animate().cancel();
@@ -118,6 +126,24 @@ final class EpisodeSheet {
                     if (!open) panel.setVisibility(View.INVISIBLE);
                 }).start();
         scrim.setVisibility(View.GONE);
+    }
+
+    /** 换了一部剧：把自己加进 host 的两个视图摘掉，别留在层级里（宿主再建新面板）。 */
+    void destroy() {
+        open = false;
+        cb = null;
+        if (panel != null) {
+            panel.animate().cancel();
+            host.removeView(panel);
+            panel = null;
+        }
+        if (scrim != null) {
+            host.removeView(scrim);
+            scrim = null;
+        }
+        grid = null;
+        pageRow = null;
+        adapter = null;
     }
 
     // ---------------- 构建 ----------------

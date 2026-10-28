@@ -37,8 +37,8 @@ import java.util.concurrent.atomic.AtomicBoolean;
  *   - release() 直接 disconnect() 连接 + notifyAll()，能立刻打断 read()（原来 interrupt()
  *     打不断阻塞中的 socket 读）；
  *   - waitFor() 从 15ms 轮询改成条件变量 wait/notifyAll；
- *   - 新增 softLimit：预载的那一集只下到 N MB 就停，把带宽让给正在播的一集，
- *     激活时 setSoftLimit(-1) 立刻满速。
+ *   - 新增 softLimit（读窗）：预载的那一集只下到"读前沿 + N MB"就停，把带宽让给正在播的一集，
+ *     激活时 setUnlimited() 立刻满速。
  *
  * v0.8.0 的关键改动（这三个是"切集卡好几秒"的真因）：
  *   - softLimit 从"绝对字节数"改成**读窗**：`softLimit = frontier + aheadBytes`，
@@ -53,8 +53,8 @@ public final class StreamSource implements DataSource {
 
     private static final String TAG = "StreamSource";
     private static final int HEAD = 256 * 1024;
-    /** 少于这么多字节说明头都不完整，无法续传。 */
-    private static final int HEAD_MIN = 256 * 1024;
+    /** 少于这么多字节的残片不值得比较（连 offset 0 的 4KB 都可能不完整）。 */
+    private static final int RESUME_MIN = 32 * 1024;
     private static final int WAIT_TIMEOUT_MS = 30_000;
     /** 进度回调节流：至少 1MB 或 300ms 才回调一次（原来每 64KB 一次，UI 线程被打满）。 */
     private static final long PROG_BYTES = 1024 * 1024;
@@ -107,20 +107,6 @@ public final class StreamSource implements DataSource {
         this.doneMark = new File(cache.getAbsolutePath() + ".done");
         this.mode = mode == null ? "full" : mode;
         this.prog = prog;
-    }
-
-    /** 缓存文件（getCacheDir 下的 .enc），供播放页退出时精确清理。 */
-    public File cacheFile() {
-        return cache;
-    }
-
-    /** 旧接口：直接给绝对字节闸门（-1 = 不限速）。新代码请用下面三个语义化方法。 */
-    public void setSoftLimit(long bytes) {
-        aheadMode = false;
-        synchronized (lock) {
-            softLimit = bytes;
-            lock.notifyAll();
-        }
     }
 
     /**
@@ -252,18 +238,11 @@ public final class StreamSource implements DataSource {
         }
     }
 
-    public long totalSize() {
-        return total;
-    }
-
-    public long downloaded() {
-        return downloaded;
-    }
-
     // ---------------- 准备 ----------------
     private void prepare() throws IOException {
-        prepared = true;
-
+        // 注意：不能在开头就置 prepared=true。ExoPlayer 失败后会拿同一个 DataSource
+        // 再 open 一次（Factory 返回的是这个实例），早置位会让第二次直接跳过准备，
+        // 拿着 info/ranger 都是 null 的状态进 read() → NPE。
         // 1) 用 Range 取头部，同时拿到文件总长度
         byte[] head = fetchRange(0, HEAD - 1);
         if (head == null || head.length < 4096) throw new IOException("取文件头失败");
@@ -284,12 +263,13 @@ public final class StreamSource implements DataSource {
         long have = cache.exists() ? cache.length() : 0;
         boolean done = doneMark.exists();
 
-        if (done && have == total) {
-            // 整集已在缓存里（旧版本留下的 .done 也可能来自 fallback 路径）
-            downloaded = have;
+        if (have >= total) {
+            // 整集已经下满：.done 标记丢了（进程被杀）也不能当成"没下过"重下一遍
+            downloaded = total;
             finished = true;
-            if (prog != null) prog.on(have, total, true);
-        } else if (canResume(have, total, done, head)) {
+            if (!done) markDone();
+            if (prog != null) prog.on(total, total, true);
+        } else if (canResume(have, noRange, head)) {
             // 上次下到一半（比如预载到 16MB 就被切走）：能对得上就接着下，别作废
             Cache.ensure(cache.getParentFile(), 8L * 1024 * 1024);
             downloaded = have;
@@ -323,15 +303,19 @@ public final class StreamSource implements DataSource {
         Log.i(TAG, "prepare ok: total=" + total + " cached=" + downloaded
                 + " noRange=" + noRange + " tracks=" + info.tracks.size()
                 + " patches=" + info.patches.size());
+        prepared = true;      // 全部成功之后才算准备好
     }
 
     /**
-     * 能否续传：文件里已经有完整头、长度小于总长、没有 .done 标记、服务器支持 Range，
-     * 且缓存前 4KB 与刚取到的头一致（换 CDN / 换了清晰度后偏移会变，必须比对）。
+     * 能否续传：服务器支持 Range、文件里已经有头、且缓存前 4KB 与刚取到的头一致
+     * （换 CDN / 换了清晰度后偏移会变，必须比对）。
+     *
+     * 门槛只有 RESUME_MIN：以前要求 ≥256KB（完整头）才肯续传，结果"预载刚开始就被切走"
+     * 的半截文件全被删掉重下 —— 上滑越快越慢，正是用户看到的"切换要等下载完"。
+     * 头的一致性由 headMatches 单独保证，不需要文件长度够长。
      */
-    private boolean canResume(long have, long total, boolean done, byte[] head) {
-        if (done || noRange) return false;
-        if (have < HEAD_MIN || have >= total) return false;
+    private boolean canResume(long have, boolean done, byte[] head) {
+        if (done || noRange || have < RESUME_MIN) return false;
         return headMatches(head, 4096);
     }
 
@@ -462,6 +446,10 @@ public final class StreamSource implements DataSource {
 
     private void finishDownload() {
         finished = true;
+        markDone();
+    }
+
+    private void markDone() {
         try {
             if (!doneMark.exists()) doneMark.createNewFile();
         } catch (IOException ignored) {

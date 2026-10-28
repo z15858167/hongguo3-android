@@ -9,6 +9,8 @@ captures/
 *.apk
 *.aab
 *.keystore
+# 例外：固定签名用的 jks 必须进仓库，否则 CI 与本机签名不一致
+!keystore/hongguo.jks
 
 # 隐藏的本地/工具目录，一律不进仓库
 .workbuddy/

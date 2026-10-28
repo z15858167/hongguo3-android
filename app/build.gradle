@@ -2,6 +2,15 @@ plugins {
     id 'com.android.application'
 }
 
+// 固定签名：keystore/keystore.properties 指向仓库里的 hongguo.jks。
+// 没有它就只能回落到 AGP 的 debug 签名（每台机器/每次 CI 都不一样 → 覆盖安装报签名不同）。
+def keystorePropsFile = rootProject.file('keystore/keystore.properties')
+def hasFixedKey = keystorePropsFile.exists()
+def keystoreProps = new Properties()
+if (hasFixedKey) {
+    keystorePropsFile.withInputStream { keystoreProps.load(it) }
+}
+
 android {
     namespace 'com.hongguo.client'
     compileSdk 34
@@ -19,8 +28,8 @@ android {
         applicationId "com.hongguo.client"
         minSdk 24
         targetSdk 34
-        versionCode 12
-        versionName "0.8.0"
+        versionCode 13
+        versionName "0.9.0"
         ndk {
             abiFilters 'arm64-v8a'
         }
@@ -38,15 +47,31 @@ android {
         }
     }
 
+    signingConfigs {
+        fixed {
+            if (hasFixedKey) {
+                storeFile rootProject.file("keystore/${keystoreProps['storeFile']}")
+                storePassword keystoreProps['storePassword']
+                keyAlias keystoreProps['keyAlias']
+                keyPassword keystoreProps['keyPassword']
+            }
+        }
+    }
+
     buildTypes {
+        debug {
+            // 本机调试包也用同一把 key：这样 Debug 包和 CI 的 Release 包可以互相覆盖安装，
+            // 不会出现"装过 Debug 版就再也装不上 Release"的签名冲突。
+            signingConfig hasFixedKey ? signingConfigs.fixed : signingConfigs.debug
+        }
         release {
             // 千万别开 minify：ms.bd.c.m / ms.bd.c.a4$a / ...metasec.ml.MS 这三个类
             // 没有任何 Java 代码引用它们（只有 so 通过 FindClass / RegisterNatives 找），
             // 一旦被 R8 移除或改名，加载 so 就会崩。
             minifyEnabled false
             shrinkResources false
-            // CI 上没有自定义 keystore，用 AGP 自带的 debug 签名（可直接安装）
-            signingConfig signingConfigs.debug
+            // 固定 key 签名，本机与 CI 一致，可直接覆盖安装；没有 keystore 时退回 debug 签名
+            signingConfig hasFixedKey ? signingConfigs.fixed : signingConfigs.debug
         }
     }
 
