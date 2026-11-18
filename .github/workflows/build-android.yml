@@ -17,6 +17,14 @@ on:
       - '.github/workflows/build-android.yml'
   pull_request:
     branches: [ main ]
+    paths:
+      - 'app/**'
+      - 'tools/**'
+      - 'build.gradle'
+      - 'settings.gradle'
+      - 'gradle.properties'
+      - 'keystore/**'
+      - '.github/workflows/build-android.yml'
   workflow_dispatch:
 
 concurrency:
